@@ -1,0 +1,14 @@
+[package]
+name = "flowforge-agents"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flowforge-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }

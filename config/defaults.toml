@@ -1,0 +1,41 @@
+[general]
+log_level = "info"
+telemetry = true
+
+[memory]
+db_name = "flowforge.db"
+hnsw_m = 16
+hnsw_ef_construction = 100
+hnsw_ef_search = 50
+embedding_dim = 128
+
+[agents]
+load_builtin = true
+load_global = true
+load_project = true
+
+[routing]
+pattern_weight = 0.40
+capability_weight = 0.30
+learned_weight = 0.25
+priority_weight = 0.05
+
+[patterns]
+short_term_max = 500
+short_term_ttl_hours = 24
+long_term_max = 2000
+promotion_min_usage = 3
+promotion_min_confidence = 0.6
+decay_rate_per_hour = 0.005
+dedup_similarity_threshold = 0.95
+
+[tmux]
+session_name = "flowforge"
+auto_start = true
+refresh_interval_ms = 1000
+
+[hooks]
+bash_validation = true
+edit_tracking = true
+routing = true
+learning = true
