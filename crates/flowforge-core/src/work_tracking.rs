@@ -155,6 +155,49 @@ pub trait WorkDb {
     fn record_work_event(&self, event: &WorkEvent) -> Result<i64>;
     fn get_work_events(&self, work_item_id: &str, limit: usize) -> Result<Vec<WorkEvent>>;
     fn get_recent_work_events(&self, limit: usize) -> Result<Vec<WorkEvent>>;
+
+    // Work-stealing methods
+    fn claim_work_item(&self, id: &str, session_id: &str) -> Result<bool>;
+    fn release_work_item(&self, id: &str) -> Result<()>;
+    fn update_heartbeat(&self, session_id: &str) -> Result<u64>;
+    fn update_progress(&self, id: &str, progress: i32) -> Result<()>;
+    fn mark_stale_items_stealable(&self, stale_mins: u64, min_progress: i32) -> Result<u64>;
+    fn auto_release_abandoned(&self, abandon_mins: u64) -> Result<u64>;
+    fn get_stealable_items(&self, limit: usize) -> Result<Vec<WorkItem>>;
+    fn steal_work_item(&self, id: &str, new_session_id: &str) -> Result<bool>;
+}
+
+// ── Work-stealing functions ──
+
+/// Claim a work item for a session.
+pub fn claim_item(db: &dyn WorkDb, id: &str, session_id: &str) -> Result<bool> {
+    db.claim_work_item(id, session_id)
+}
+
+/// Release a claimed work item.
+pub fn release_item(db: &dyn WorkDb, id: &str) -> Result<()> {
+    db.release_work_item(id)
+}
+
+/// Steal a stealable work item for a new session.
+pub fn steal_item(db: &dyn WorkDb, id: &str, new_session_id: &str) -> Result<bool> {
+    db.steal_work_item(id, new_session_id)
+}
+
+/// Detect and mark stale items, auto-release abandoned ones.
+pub fn detect_stale(db: &dyn WorkDb, config: &WorkTrackingConfig) -> Result<(u64, u64)> {
+    let ws = &config.work_stealing;
+    if !ws.enabled {
+        return Ok((0, 0));
+    }
+    let marked = db.mark_stale_items_stealable(ws.stale_threshold_mins, ws.stale_min_progress)?;
+    let released = db.auto_release_abandoned(ws.abandon_threshold_mins)?;
+    Ok((marked, released))
+}
+
+/// List stealable work items.
+pub fn list_stealable(db: &dyn WorkDb, limit: usize) -> Result<Vec<WorkItem>> {
+    db.get_stealable_items(limit)
 }
 
 // ── External backend sync (best-effort, CLI-based) ──
@@ -376,6 +419,11 @@ fn sync_from_kanbus(db: &dyn WorkDb, config: &WorkTrackingConfig) -> Result<u32>
             completed_at: None,
             session_id: None,
             metadata: None,
+            claimed_by: None,
+            claimed_at: None,
+            last_heartbeat: None,
+            progress: 0,
+            stealable: false,
         };
 
         db.create_work_item(&work_item)?;
@@ -437,6 +485,11 @@ fn sync_from_beads(db: &dyn WorkDb) -> Result<u32> {
             completed_at: None,
             session_id: None,
             metadata: None,
+            claimed_by: None,
+            claimed_at: None,
+            last_heartbeat: None,
+            progress: 0,
+            stealable: false,
         };
 
         db.create_work_item(&work_item)?;
@@ -513,6 +566,11 @@ fn sync_from_claude_tasks(db: &dyn WorkDb, config: &WorkTrackingConfig) -> Resul
             completed_at: None,
             session_id: None,
             metadata: None,
+            claimed_by: None,
+            claimed_at: None,
+            last_heartbeat: None,
+            progress: 0,
+            stealable: false,
         };
 
         db.create_work_item(&work_item)?;

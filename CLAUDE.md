@@ -31,13 +31,45 @@ FlowForge uses BOTH a fast Rust-based memory system AND Claude's native auto-mem
 - Claude memory: design decisions, workflow preferences, project philosophy
 - Use BOTH for critical knowledge — redundancy improves recall
 
-### Work Tracking
+### Work Tracking & Work-Stealing
 - FlowForge tracks all work items (epics, tasks, bugs) automatically via hooks
 - Every task completion, agent assignment, and status change is logged
+- **Work-stealing**: agents auto-detect stale/abandoned tasks and redistribute them
 - Use `flowforge work status` to see active work
 - Use `flowforge work create` to create tracked items
+- Use `flowforge work claim <id>` / `flowforge work release <id>` for claim lifecycle
+- Use `flowforge work stealable` / `flowforge work steal` for redistribution
+- Use `flowforge work load` to see work distribution across agents
 - Supported backends: Claude Tasks, Beads, Kanbus (auto-detected)
-- MCP tools: `work_create`, `work_list`, `work_update`, `work_log`
+- MCP tools: `work_create`, `work_list`, `work_update`, `work_log`, `work_claim`, `work_release`, `work_steal`, `work_heartbeat`
+
+### Guidance Control Plane
+- Enforces configurable safety rules on ALL tool uses via `pre_tool_use` hook
+- 5 built-in gates: destructive ops, secrets detection, file scope, custom rules, diff size
+- Trust scoring with decay and auto-promotion thresholds
+- SHA-256 auditable hash chain for all gate decisions
+- Use `flowforge guidance rules` to see active gates
+- Use `flowforge guidance trust` to check session trust score
+- Use `flowforge guidance audit` / `flowforge guidance verify` for audit trail
+- MCP tools: `guidance_rules`, `guidance_trust`, `guidance_audit`
+
+### Plugin SDK
+- Extend FlowForge with custom tools, hooks, and agents without recompilation
+- Plugins live in `.flowforge/plugins/<name>/` with a `plugin.toml` manifest
+- Plugin tools execute shell commands with JSON stdin/stdout
+- Plugin hooks run in priority order during `pre_tool_use` and other events
+- Plugin agents load as markdown files with `AgentSource::Plugin`
+- Use `flowforge plugin list` / `flowforge plugin info <name>` to manage
+- MCP tools: `plugin_list`, `plugin_info`
+
+### Trajectory Learning
+- Records complete execution paths (tool sequences) per session
+- Automatically judges outcomes: success ratio + work item completion
+- Successful trajectories are distilled into reusable strategy patterns
+- Use `flowforge learn trajectories` to list recorded trajectories
+- Use `flowforge learn trajectory <id>` to see steps and verdict
+- Use `flowforge learn judge <id>` to manually judge a trajectory
+- MCP tools: `trajectory_list`, `trajectory_get`, `trajectory_judge`
 
 ### tmux Monitor
 - Run `flowforge tmux start` for real-time team monitoring

@@ -45,4 +45,10 @@ pub enum Error {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Guidance error: {0}")]
+    Guidance(String),
+
+    #[error("Plugin error: {0}")]
+    Plugin(String),
 }

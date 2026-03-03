@@ -20,6 +20,10 @@ pub struct FlowForgeConfig {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub work_tracking: WorkTrackingConfig,
+    #[serde(default)]
+    pub guidance: GuidanceConfig,
+    #[serde(default)]
+    pub plugins: PluginsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +128,12 @@ pub struct PatternsConfig {
     pub decay_rate_per_hour: f64,
     #[serde(default = "default_dedup_threshold")]
     pub dedup_similarity_threshold: f64,
+    #[serde(default = "default_trajectory_max")]
+    pub trajectory_max: usize,
+    #[serde(default = "default_trajectory_prune_days")]
+    pub trajectory_prune_days: u64,
+    #[serde(default = "default_trajectory_merge_threshold")]
+    pub trajectory_merge_threshold: f64,
 }
 
 impl Default for PatternsConfig {
@@ -136,6 +146,9 @@ impl Default for PatternsConfig {
             promotion_min_confidence: default_promotion_confidence(),
             decay_rate_per_hour: default_decay_rate(),
             dedup_similarity_threshold: default_dedup_threshold(),
+            trajectory_max: default_trajectory_max(),
+            trajectory_prune_days: default_trajectory_prune_days(),
+            trajectory_merge_threshold: default_trajectory_merge_threshold(),
         }
     }
 }
@@ -197,6 +210,8 @@ pub struct WorkTrackingConfig {
     pub beads: BeadsSyncConfig,
     #[serde(default)]
     pub claude_tasks: ClaudeTasksSyncConfig,
+    #[serde(default)]
+    pub work_stealing: WorkStealingConfig,
 }
 
 impl Default for WorkTrackingConfig {
@@ -208,6 +223,30 @@ impl Default for WorkTrackingConfig {
             kanbus: KanbusSyncConfig::default(),
             beads: BeadsSyncConfig::default(),
             claude_tasks: ClaudeTasksSyncConfig::default(),
+            work_stealing: WorkStealingConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkStealingConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_stale_threshold")]
+    pub stale_threshold_mins: u64,
+    #[serde(default = "default_abandon_threshold")]
+    pub abandon_threshold_mins: u64,
+    #[serde(default = "default_stale_min_progress")]
+    pub stale_min_progress: i32,
+}
+
+impl Default for WorkStealingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            stale_threshold_mins: default_stale_threshold(),
+            abandon_threshold_mins: default_abandon_threshold(),
+            stale_min_progress: default_stale_min_progress(),
         }
     }
 }
@@ -227,8 +266,90 @@ pub struct ClaudeTasksSyncConfig {
     pub list_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuidanceConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub destructive_ops_gate: bool,
+    #[serde(default = "default_true")]
+    pub file_scope_gate: bool,
+    #[serde(default = "default_true")]
+    pub diff_size_gate: bool,
+    #[serde(default = "default_true")]
+    pub secrets_gate: bool,
+    #[serde(default = "default_max_diff_lines")]
+    pub max_diff_lines: usize,
+    #[serde(default = "default_trust_initial")]
+    pub trust_initial_score: f64,
+    #[serde(default = "default_trust_ask_threshold")]
+    pub trust_ask_threshold: f64,
+    #[serde(default = "default_trust_decay")]
+    pub trust_decay_per_hour: f64,
+    #[serde(default)]
+    pub protected_paths: Vec<String>,
+    #[serde(default)]
+    pub custom_rules: Vec<crate::types::GuidanceRule>,
+}
+
+impl Default for GuidanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            destructive_ops_gate: true,
+            file_scope_gate: true,
+            diff_size_gate: true,
+            secrets_gate: true,
+            max_diff_lines: default_max_diff_lines(),
+            trust_initial_score: default_trust_initial(),
+            trust_ask_threshold: default_trust_ask_threshold(),
+            trust_decay_per_hour: default_trust_decay(),
+            protected_paths: vec![],
+            custom_rules: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginsConfig {
+    #[serde(default)]
+    pub enabled: Vec<String>,
+    #[serde(default)]
+    pub disabled: Vec<String>,
+}
+
 fn default_backend_auto() -> String {
     "auto".to_string()
+}
+fn default_max_diff_lines() -> usize {
+    500
+}
+fn default_trust_initial() -> f64 {
+    0.5
+}
+fn default_trust_ask_threshold() -> f64 {
+    0.8
+}
+fn default_trust_decay() -> f64 {
+    0.02
+}
+fn default_stale_threshold() -> u64 {
+    30
+}
+fn default_abandon_threshold() -> u64 {
+    60
+}
+fn default_stale_min_progress() -> i32 {
+    25
+}
+fn default_trajectory_max() -> usize {
+    5000
+}
+fn default_trajectory_prune_days() -> u64 {
+    7
+}
+fn default_trajectory_merge_threshold() -> f64 {
+    0.9
 }
 
 // Default value functions
@@ -340,5 +461,10 @@ impl FlowForgeConfig {
     /// Get the tmux state file path
     pub fn tmux_state_path() -> PathBuf {
         Self::project_dir().join("tmux-state.json")
+    }
+
+    /// Get the plugins directory
+    pub fn plugins_dir() -> PathBuf {
+        Self::project_dir().join("plugins")
     }
 }

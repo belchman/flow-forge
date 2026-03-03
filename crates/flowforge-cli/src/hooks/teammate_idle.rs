@@ -17,6 +17,11 @@ pub fn run() -> Result<()> {
     if db_path.exists() {
         if let Ok(db) = MemoryDb::open(&db_path) {
             let _ = db.update_agent_session_status(&input.teammate_name, AgentSessionStatus::Idle);
+
+            // Detect and handle stale work items
+            if config.work_tracking.work_stealing.enabled {
+                let _ = flowforge_core::work_tracking::detect_stale(&db, &config.work_tracking);
+            }
         }
     }
 

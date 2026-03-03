@@ -41,3 +41,40 @@ pub fn run_safe(
         }
     }
 }
+
+use flowforge_core::plugin::LoadedPlugin;
+use flowforge_core::plugin_exec::exec_plugin_hook;
+
+/// Run plugin hooks for a given event. Returns first deny/ask response if any.
+pub fn run_plugin_hooks(
+    event: &str,
+    raw_input: &serde_json::Value,
+    plugins: &[LoadedPlugin],
+    _plugin_dir: &std::path::Path,
+) -> Option<serde_json::Value> {
+    let mut hooks: Vec<_> = plugins
+        .iter()
+        .flat_map(|p| {
+            p.manifest.hooks.iter().filter_map(move |h| {
+                if h.event.eq_ignore_ascii_case(event) {
+                    Some((h.priority, &h.command, &p.dir))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    hooks.sort_by_key(|(pri, _, _)| *pri);
+
+    for (_, command, dir) in hooks {
+        if let Some(response) = exec_plugin_hook(command, dir, raw_input, 5000) {
+            // Check if response indicates deny or ask
+            if let Some(action) = response.get("action").and_then(|v| v.as_str()) {
+                if action == "deny" || action == "ask" {
+                    return Some(response);
+                }
+            }
+        }
+    }
+    None
+}

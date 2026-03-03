@@ -39,4 +39,5 @@ dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+sha2 = "0.10"
 fs2 = "0.4"

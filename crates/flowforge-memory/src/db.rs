@@ -4,9 +4,12 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use flowforge_core::{
-    work_tracking::WorkDb, AgentSession, AgentSessionStatus, Checkpoint, ConversationMessage,
-    EditRecord, Error, LongTermPattern, MailboxMessage, Result, RoutingWeight, SessionFork,
-    SessionInfo, ShortTermPattern, WorkEvent, WorkFilter, WorkItem,
+    trajectory::{StepOutcome, Trajectory, TrajectoryStatus, TrajectoryStep, TrajectoryVerdict},
+    types::{GateAction, GateDecision, RiskLevel, TrustScore},
+    work_tracking::WorkDb,
+    AgentSession, AgentSessionStatus, Checkpoint, ConversationMessage, EditRecord, Error,
+    LongTermPattern, MailboxMessage, Result, RoutingWeight, SessionFork, SessionInfo,
+    ShortTermPattern, WorkEvent, WorkFilter, WorkItem,
 };
 
 /// (db_id, source_type, source_id, vector)
@@ -225,6 +228,63 @@ impl MemoryDb {
             CREATE INDEX IF NOT EXISTS idx_mailbox_to ON agent_mailbox(to_session_id);
             CREATE INDEX IF NOT EXISTS idx_mailbox_unread ON agent_mailbox(to_session_id, read_at);
             CREATE INDEX IF NOT EXISTS idx_mailbox_from ON agent_mailbox(from_session_id);
+
+            CREATE TABLE IF NOT EXISTS trust_scores (
+                session_id TEXT PRIMARY KEY,
+                score REAL DEFAULT 0.5,
+                total_checks INTEGER DEFAULT 0,
+                denials INTEGER DEFAULT 0,
+                asks INTEGER DEFAULT 0,
+                allows INTEGER DEFAULT 0,
+                last_updated TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS gate_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                rule_id TEXT,
+                gate_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                trust_before REAL,
+                trust_after REAL,
+                timestamp TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                prev_hash TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS trajectories (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                work_item_id TEXT,
+                agent_name TEXT,
+                task_description TEXT,
+                status TEXT DEFAULT 'recording',
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                verdict TEXT,
+                confidence REAL,
+                metadata TEXT,
+                embedding_id INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS trajectory_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trajectory_id TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input_hash TEXT,
+                outcome TEXT DEFAULT 'success',
+                duration_ms INTEGER,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (trajectory_id) REFERENCES trajectories(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_trajectory_steps_traj ON trajectory_steps(trajectory_id);
+            CREATE INDEX IF NOT EXISTS idx_trajectories_session ON trajectories(session_id);
+            CREATE INDEX IF NOT EXISTS idx_trajectories_status ON trajectories(status);
         ",
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
@@ -232,6 +292,20 @@ impl MemoryDb {
         // Migrations: add columns to existing tables if missing
         self.migrate_add_column("sessions", "transcript_path", "TEXT")?;
         self.migrate_add_column("agent_sessions", "transcript_path", "TEXT")?;
+
+        // Work-stealing migrations
+        self.migrate_add_column("work_items", "claimed_by", "TEXT")?;
+        self.migrate_add_column("work_items", "claimed_at", "TEXT")?;
+        self.migrate_add_column("work_items", "last_heartbeat", "TEXT")?;
+        self.migrate_add_column("work_items", "progress", "INTEGER DEFAULT 0")?;
+        self.migrate_add_column("work_items", "stealable", "INTEGER DEFAULT 0")?;
+
+        // Work-stealing indexes (best-effort)
+        let _ = self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_work_items_claimed ON work_items(claimed_by);
+             CREATE INDEX IF NOT EXISTS idx_work_items_stealable ON work_items(stealable);
+             CREATE INDEX IF NOT EXISTS idx_work_items_heartbeat ON work_items(last_heartbeat);",
+        );
 
         Ok(())
     }
@@ -1070,8 +1144,9 @@ impl MemoryDb {
             .execute(
                 "INSERT OR REPLACE INTO work_items
                  (id, external_id, backend, item_type, title, description, status, assignee,
-                  parent_id, priority, labels, created_at, updated_at, completed_at, session_id, metadata)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  parent_id, priority, labels, created_at, updated_at, completed_at, session_id, metadata,
+                  claimed_by, claimed_at, last_heartbeat, progress, stealable)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     item.id,
                     item.external_id,
@@ -1089,6 +1164,11 @@ impl MemoryDb {
                     item.completed_at.map(|t| t.to_rfc3339()),
                     item.session_id,
                     item.metadata,
+                    item.claimed_by,
+                    item.claimed_at.map(|t| t.to_rfc3339()),
+                    item.last_heartbeat.map(|t| t.to_rfc3339()),
+                    item.progress,
+                    item.stealable as i32,
                 ],
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
@@ -1099,7 +1179,8 @@ impl MemoryDb {
         self.conn
             .query_row(
                 "SELECT id, external_id, backend, item_type, title, description, status, assignee,
-                        parent_id, priority, labels, created_at, updated_at, completed_at, session_id, metadata
+                        parent_id, priority, labels, created_at, updated_at, completed_at, session_id, metadata,
+                        claimed_by, claimed_at, last_heartbeat, progress, stealable
                  FROM work_items WHERE id = ?1",
                 params![id],
                 |row| Ok(parse_work_item_row(row)),
@@ -1112,7 +1193,8 @@ impl MemoryDb {
         self.conn
             .query_row(
                 "SELECT id, external_id, backend, item_type, title, description, status, assignee,
-                        parent_id, priority, labels, created_at, updated_at, completed_at, session_id, metadata
+                        parent_id, priority, labels, created_at, updated_at, completed_at, session_id, metadata,
+                        claimed_by, claimed_at, last_heartbeat, progress, stealable
                  FROM work_items WHERE external_id = ?1",
                 params![external_id],
                 |row| Ok(parse_work_item_row(row)),
@@ -1152,7 +1234,8 @@ impl MemoryDb {
     pub fn list_work_items(&self, filter: &WorkFilter) -> Result<Vec<WorkItem>> {
         let mut sql = String::from(
             "SELECT id, external_id, backend, item_type, title, description, status, assignee,
-                    parent_id, priority, labels, created_at, updated_at, completed_at, session_id, metadata
+                    parent_id, priority, labels, created_at, updated_at, completed_at, session_id, metadata,
+                    claimed_by, claimed_at, last_heartbeat, progress, stealable
              FROM work_items WHERE 1=1",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1176,6 +1259,14 @@ impl MemoryDb {
         if let Some(ref parent_id) = filter.parent_id {
             param_values.push(Box::new(parent_id.clone()));
             sql.push_str(&format!(" AND parent_id = ?{}", param_values.len()));
+        }
+        if let Some(stealable) = filter.stealable {
+            param_values.push(Box::new(stealable as i32));
+            sql.push_str(&format!(" AND stealable = ?{}", param_values.len()));
+        }
+        if let Some(ref claimed_by) = filter.claimed_by {
+            param_values.push(Box::new(claimed_by.clone()));
+            sql.push_str(&format!(" AND claimed_by = ?{}", param_values.len()));
         }
 
         sql.push_str(" ORDER BY updated_at DESC");
@@ -1828,6 +1919,496 @@ impl MemoryDb {
             .map_err(|e| Error::Sqlite(e.to_string()))?;
         Ok(())
     }
+
+    // ── Trust Scores (Guidance) ──
+
+    pub fn create_trust_score(&self, session_id: &str, initial_score: f64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO trust_scores (session_id, score, total_checks, denials, asks, allows, last_updated, created_at)
+                 VALUES (?1, ?2, 0, 0, 0, 0, ?3, ?3)",
+                params![session_id, initial_score, now],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_trust_score(&self, session_id: &str) -> Result<Option<TrustScore>> {
+        self.conn
+            .query_row(
+                "SELECT session_id, score, total_checks, denials, asks, allows, last_updated, created_at
+                 FROM trust_scores WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(TrustScore {
+                        session_id: row.get(0)?,
+                        score: row.get(1)?,
+                        total_checks: row.get(2)?,
+                        denials: row.get(3)?,
+                        asks: row.get(4)?,
+                        allows: row.get(5)?,
+                        last_updated: parse_datetime(row.get::<_, String>(6)?),
+                        created_at: parse_datetime(row.get::<_, String>(7)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn update_trust_score(
+        &self,
+        session_id: &str,
+        action: &GateAction,
+        trust_delta: f64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let (deny_inc, ask_inc, allow_inc) = match action {
+            GateAction::Deny => (1, 0, 0),
+            GateAction::Ask => (0, 1, 0),
+            GateAction::Allow => (0, 0, 1),
+        };
+        self.conn
+            .execute(
+                "UPDATE trust_scores SET
+                    score = MAX(0.0, MIN(1.0, score + ?1)),
+                    total_checks = total_checks + 1,
+                    denials = denials + ?2,
+                    asks = asks + ?3,
+                    allows = allows + ?4,
+                    last_updated = ?5
+                 WHERE session_id = ?6",
+                params![trust_delta, deny_inc, ask_inc, allow_inc, now, session_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn record_gate_decision(&self, decision: &GateDecision) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO gate_decisions
+                 (session_id, rule_id, gate_name, tool_name, action, reason, risk_level,
+                  trust_before, trust_after, timestamp, hash, prev_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    decision.session_id,
+                    decision.rule_id,
+                    decision.gate_name,
+                    decision.tool_name,
+                    decision.action.to_string(),
+                    decision.reason,
+                    decision.risk_level.to_string(),
+                    decision.trust_before,
+                    decision.trust_after,
+                    decision.timestamp.to_rfc3339(),
+                    decision.hash,
+                    decision.prev_hash,
+                ],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_gate_decisions(&self, session_id: &str, limit: usize) -> Result<Vec<GateDecision>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, rule_id, gate_name, tool_name, action, reason, risk_level,
+                        trust_before, trust_after, timestamp, hash, prev_hash
+                 FROM gate_decisions WHERE session_id = ?1
+                 ORDER BY id DESC LIMIT ?2",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id, limit], |row| {
+                Ok(GateDecision {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    rule_id: row.get(2)?,
+                    gate_name: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    action: row
+                        .get::<_, String>(5)?
+                        .parse()
+                        .unwrap_or(GateAction::Allow),
+                    reason: row.get(6)?,
+                    risk_level: row.get::<_, String>(7)?.parse().unwrap_or(RiskLevel::Low),
+                    trust_before: row.get(8)?,
+                    trust_after: row.get(9)?,
+                    timestamp: parse_datetime(row.get::<_, String>(10)?),
+                    hash: row.get(11)?,
+                    prev_hash: row.get(12)?,
+                })
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    // ── Work-Stealing ──
+
+    pub fn claim_work_item(&self, id: &str, session_id: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE work_items SET claimed_by = ?1, claimed_at = ?2, last_heartbeat = ?2, stealable = 0
+                 WHERE id = ?3 AND (claimed_by IS NULL OR stealable = 1)",
+                params![session_id, now, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(updated > 0)
+    }
+
+    pub fn release_work_item(&self, id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE work_items SET claimed_by = NULL, claimed_at = NULL, last_heartbeat = NULL,
+                 stealable = 0, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn update_heartbeat(&self, session_id: &str) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let count = self
+            .conn
+            .execute(
+                "UPDATE work_items SET last_heartbeat = ?1 WHERE claimed_by = ?2",
+                params![now, session_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(count as u64)
+    }
+
+    pub fn update_progress(&self, id: &str, progress: i32) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE work_items SET progress = ?1, updated_at = ?2 WHERE id = ?3",
+                params![progress, now, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn mark_stale_items_stealable(&self, stale_mins: u64, min_progress: i32) -> Result<u64> {
+        let threshold = Utc::now() - chrono::Duration::minutes(stale_mins as i64);
+        let count = self
+            .conn
+            .execute(
+                "UPDATE work_items SET stealable = 1
+                 WHERE claimed_by IS NOT NULL AND stealable = 0
+                   AND last_heartbeat < ?1 AND progress < ?2
+                   AND status = 'in_progress'",
+                params![threshold.to_rfc3339(), min_progress],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(count as u64)
+    }
+
+    pub fn auto_release_abandoned(&self, abandon_mins: u64) -> Result<u64> {
+        let threshold = Utc::now() - chrono::Duration::minutes(abandon_mins as i64);
+        let now = Utc::now().to_rfc3339();
+        let count = self
+            .conn
+            .execute(
+                "UPDATE work_items SET claimed_by = NULL, claimed_at = NULL,
+                 last_heartbeat = NULL, stealable = 0, status = 'pending', updated_at = ?1
+                 WHERE claimed_by IS NOT NULL AND last_heartbeat < ?2
+                   AND status = 'in_progress'",
+                params![now, threshold.to_rfc3339()],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(count as u64)
+    }
+
+    pub fn get_stealable_items(&self, limit: usize) -> Result<Vec<WorkItem>> {
+        let filter = WorkFilter {
+            stealable: Some(true),
+            limit: Some(limit),
+            ..Default::default()
+        };
+        self.list_work_items(&filter)
+    }
+
+    pub fn steal_work_item(&self, id: &str, new_session_id: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE work_items SET claimed_by = ?1, claimed_at = ?2, last_heartbeat = ?2,
+                 stealable = 0, progress = 0
+                 WHERE id = ?3 AND stealable = 1",
+                params![new_session_id, now, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(updated > 0)
+    }
+
+    // ── Trajectories ──
+
+    pub fn create_trajectory(&self, trajectory: &Trajectory) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO trajectories
+                 (id, session_id, work_item_id, agent_name, task_description, status,
+                  started_at, ended_at, verdict, confidence, metadata, embedding_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    trajectory.id,
+                    trajectory.session_id,
+                    trajectory.work_item_id,
+                    trajectory.agent_name,
+                    trajectory.task_description,
+                    trajectory.status.to_string(),
+                    trajectory.started_at.to_rfc3339(),
+                    trajectory.ended_at.map(|t| t.to_rfc3339()),
+                    trajectory.verdict.map(|v| v.to_string()),
+                    trajectory.confidence,
+                    trajectory.metadata,
+                    trajectory.embedding_id,
+                ],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_trajectory(&self, id: &str) -> Result<Option<Trajectory>> {
+        self.conn
+            .query_row(
+                "SELECT id, session_id, work_item_id, agent_name, task_description, status,
+                        started_at, ended_at, verdict, confidence, metadata, embedding_id
+                 FROM trajectories WHERE id = ?1",
+                params![id],
+                |row| Ok(parse_trajectory_row(row)),
+            )
+            .optional()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn get_active_trajectory(&self, session_id: &str) -> Result<Option<Trajectory>> {
+        self.conn
+            .query_row(
+                "SELECT id, session_id, work_item_id, agent_name, task_description, status,
+                        started_at, ended_at, verdict, confidence, metadata, embedding_id
+                 FROM trajectories WHERE session_id = ?1 AND status = 'recording'
+                 ORDER BY started_at DESC LIMIT 1",
+                params![session_id],
+                |row| Ok(parse_trajectory_row(row)),
+            )
+            .optional()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn end_trajectory(&self, id: &str, status: TrajectoryStatus) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE trajectories SET ended_at = ?1, status = ?2 WHERE id = ?3",
+                params![now, status.to_string(), id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn judge_trajectory(
+        &self,
+        id: &str,
+        verdict: TrajectoryVerdict,
+        confidence: f64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE trajectories SET status = 'judged', verdict = ?1, confidence = ?2, ended_at = COALESCE(ended_at, ?3)
+                 WHERE id = ?4",
+                params![verdict.to_string(), confidence, now, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn list_trajectories(
+        &self,
+        session_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Trajectory>> {
+        let mut sql = String::from(
+            "SELECT id, session_id, work_item_id, agent_name, task_description, status,
+                    started_at, ended_at, verdict, confidence, metadata, embedding_id
+             FROM trajectories WHERE 1=1",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(sid) = session_id {
+            param_values.push(Box::new(sid.to_string()));
+            sql.push_str(&format!(" AND session_id = ?{}", param_values.len()));
+        }
+        if let Some(st) = status {
+            param_values.push(Box::new(st.to_string()));
+            sql.push_str(&format!(" AND status = ?{}", param_values.len()));
+        }
+        param_values.push(Box::new(limit as i64));
+        sql.push_str(&format!(
+            " ORDER BY started_at DESC LIMIT ?{}",
+            param_values.len()
+        ));
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let params_slice: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_slice.as_slice(), |row| Ok(parse_trajectory_row(row)))
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn set_trajectory_task_description(&self, id: &str, task_description: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE trajectories SET task_description = ?1 WHERE id = ?2",
+                params![task_description, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn link_trajectory_work_item(&self, trajectory_id: &str, work_item_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE trajectories SET work_item_id = ?1 WHERE id = ?2",
+                params![work_item_id, trajectory_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    // ── Trajectory Steps ──
+
+    pub fn record_trajectory_step(
+        &self,
+        trajectory_id: &str,
+        tool_name: &str,
+        tool_input_hash: Option<&str>,
+        outcome: StepOutcome,
+        duration_ms: Option<i64>,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO trajectory_steps
+                 (trajectory_id, step_index, tool_name, tool_input_hash, outcome, duration_ms, timestamp)
+                 VALUES (?1, (SELECT COALESCE(MAX(step_index), -1) + 1 FROM trajectory_steps WHERE trajectory_id = ?1),
+                         ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    trajectory_id,
+                    tool_name,
+                    tool_input_hash,
+                    outcome.to_string(),
+                    duration_ms,
+                    now,
+                ],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_trajectory_steps(&self, trajectory_id: &str) -> Result<Vec<TrajectoryStep>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, trajectory_id, step_index, tool_name, tool_input_hash, outcome, duration_ms, timestamp
+                 FROM trajectory_steps WHERE trajectory_id = ?1 ORDER BY step_index ASC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![trajectory_id], |row| {
+                Ok(TrajectoryStep {
+                    id: row.get(0)?,
+                    trajectory_id: row.get(1)?,
+                    step_index: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    tool_input_hash: row.get(4)?,
+                    outcome: row
+                        .get::<_, String>(5)?
+                        .parse()
+                        .unwrap_or(StepOutcome::Success),
+                    duration_ms: row.get(6)?,
+                    timestamp: parse_datetime(row.get::<_, String>(7)?),
+                })
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn trajectory_success_ratio(&self, trajectory_id: &str) -> Result<f64> {
+        let (total, successes): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*), SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END)
+                 FROM trajectory_steps WHERE trajectory_id = ?1",
+                params![trajectory_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        if total == 0 {
+            return Ok(0.0);
+        }
+        Ok(successes as f64 / total as f64)
+    }
+
+    pub fn trajectory_tool_sequence(&self, trajectory_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT tool_name FROM trajectory_steps WHERE trajectory_id = ?1 ORDER BY step_index ASC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![trajectory_id], |row| row.get(0))
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn delete_old_failed_trajectories(&self, older_than_days: u64) -> Result<u32> {
+        let threshold = Utc::now() - chrono::Duration::days(older_than_days as i64);
+        // Steps are cascade-deleted via FK
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM trajectories WHERE status = 'failed' AND started_at < ?1",
+                params![threshold.to_rfc3339()],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    pub fn count_trajectories_by_status(&self) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status, COUNT(*) FROM trajectories GROUP BY status")
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
 }
 
 impl WorkDb for MemoryDb {
@@ -1866,6 +2447,30 @@ impl WorkDb for MemoryDb {
     }
     fn get_recent_work_events(&self, limit: usize) -> Result<Vec<WorkEvent>> {
         self.get_recent_work_events(limit)
+    }
+    fn claim_work_item(&self, id: &str, session_id: &str) -> Result<bool> {
+        self.claim_work_item(id, session_id)
+    }
+    fn release_work_item(&self, id: &str) -> Result<()> {
+        self.release_work_item(id)
+    }
+    fn update_heartbeat(&self, session_id: &str) -> Result<u64> {
+        self.update_heartbeat(session_id)
+    }
+    fn update_progress(&self, id: &str, progress: i32) -> Result<()> {
+        self.update_progress(id, progress)
+    }
+    fn mark_stale_items_stealable(&self, stale_mins: u64, min_progress: i32) -> Result<u64> {
+        self.mark_stale_items_stealable(stale_mins, min_progress)
+    }
+    fn auto_release_abandoned(&self, abandon_mins: u64) -> Result<u64> {
+        self.auto_release_abandoned(abandon_mins)
+    }
+    fn get_stealable_items(&self, limit: usize) -> Result<Vec<WorkItem>> {
+        self.get_stealable_items(limit)
+    }
+    fn steal_work_item(&self, id: &str, new_session_id: &str) -> Result<bool> {
+        self.steal_work_item(id, new_session_id)
     }
 }
 
@@ -1957,6 +2562,48 @@ fn parse_work_item_row(row: &rusqlite::Row) -> WorkItem {
             .map(parse_datetime),
         session_id: row.get(14).unwrap_or_default(),
         metadata: row.get(15).unwrap_or_default(),
+        claimed_by: row.get(16).ok().flatten(),
+        claimed_at: row
+            .get::<_, Option<String>>(17)
+            .ok()
+            .flatten()
+            .map(parse_datetime),
+        last_heartbeat: row
+            .get::<_, Option<String>>(18)
+            .ok()
+            .flatten()
+            .map(parse_datetime),
+        progress: row.get(19).unwrap_or(0),
+        stealable: row.get::<_, i32>(20).unwrap_or(0) != 0,
+    }
+}
+
+fn parse_trajectory_row(row: &rusqlite::Row) -> Trajectory {
+    Trajectory {
+        id: row.get(0).unwrap_or_default(),
+        session_id: row.get(1).unwrap_or_default(),
+        work_item_id: row.get(2).ok().flatten(),
+        agent_name: row.get(3).ok().flatten(),
+        task_description: row.get(4).ok().flatten(),
+        status: row
+            .get::<_, String>(5)
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(TrajectoryStatus::Recording),
+        started_at: parse_datetime(row.get::<_, String>(6).unwrap_or_default()),
+        ended_at: row
+            .get::<_, Option<String>>(7)
+            .ok()
+            .flatten()
+            .map(parse_datetime),
+        verdict: row
+            .get::<_, Option<String>>(8)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<TrajectoryVerdict>().ok()),
+        confidence: row.get(9).ok(),
+        metadata: row.get(10).ok().flatten(),
+        embedding_id: row.get(11).ok().flatten(),
     }
 }
 
@@ -2025,6 +2672,11 @@ mod tests {
             completed_at: None,
             session_id: None,
             metadata: None,
+            claimed_by: None,
+            claimed_at: None,
+            last_heartbeat: None,
+            progress: 0,
+            stealable: false,
         }
     }
 

@@ -79,6 +79,18 @@ impl ToolRegistry {
             "mailbox_read" => self.mailbox_read(params),
             "mailbox_history" => self.mailbox_history(params),
             "mailbox_agents" => self.mailbox_agents(params),
+            "guidance_rules" => self.guidance_rules(params),
+            "guidance_trust" => self.guidance_trust(params),
+            "guidance_audit" => self.guidance_audit(params),
+            "work_claim" => self.work_claim(params),
+            "work_release" => self.work_release(params),
+            "work_steal" => self.work_steal(params),
+            "work_heartbeat" => self.work_heartbeat(params),
+            "plugin_list" => self.plugin_list(params),
+            "plugin_info" => self.plugin_info(params),
+            "trajectory_list" => self.trajectory_list(params),
+            "trajectory_get" => self.trajectory_get(params),
+            "trajectory_judge" => self.trajectory_judge(params),
             _ => json!({ "error": format!("unknown tool: {}", name) }),
         }
     }
@@ -555,6 +567,147 @@ impl ToolRegistry {
                     "work_item_id": { "type": "string", "description": "Work item ID" }
                 },
                 "required": ["work_item_id"]
+            }),
+        });
+
+        // Guidance tools
+        self.register(ToolDef {
+            name: "guidance_rules".into(),
+            description: "List guidance rules and gate configuration".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "guidance_trust".into(),
+            description: "Get trust score for a session".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session ID (optional, defaults to current)" }
+                }
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "guidance_audit".into(),
+            description: "Get gate decision audit trail".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "limit": { "type": "integer", "description": "Max results (default 20)" }
+                }
+            }),
+        });
+
+        // Work-stealing tools
+        self.register(ToolDef {
+            name: "work_claim".into(),
+            description: "Claim a work item for the current session".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Work item ID" }
+                },
+                "required": ["id"]
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "work_release".into(),
+            description: "Release a claimed work item".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Work item ID" }
+                },
+                "required": ["id"]
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "work_steal".into(),
+            description: "Steal a stealable work item".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Work item ID (optional, steals highest priority if omitted)" }
+                }
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "work_heartbeat".into(),
+            description: "Update heartbeat for claimed work items".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "progress": { "type": "integer", "description": "Progress percentage (0-100)" },
+                    "id": { "type": "string", "description": "Work item ID for progress update" }
+                }
+            }),
+        });
+
+        // Plugin tools
+        self.register(ToolDef {
+            name: "plugin_list".into(),
+            description: "List installed plugins".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "plugin_info".into(),
+            description: "Get detailed plugin information".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Plugin name" }
+                },
+                "required": ["name"]
+            }),
+        });
+
+        // Trajectory tools
+        self.register(ToolDef {
+            name: "trajectory_list".into(),
+            description: "List recorded trajectories".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "status": { "type": "string", "description": "Filter by status: recording, completed, failed, judged" },
+                    "limit": { "type": "integer", "description": "Max results (default 20)" }
+                }
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "trajectory_get".into(),
+            description: "Get trajectory details with steps".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Trajectory ID" }
+                },
+                "required": ["id"]
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "trajectory_judge".into(),
+            description: "Judge a completed trajectory".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Trajectory ID" }
+                },
+                "required": ["id"]
             }),
         });
     }
@@ -1144,6 +1297,11 @@ impl ToolRegistry {
                 completed_at: None,
                 session_id: None,
                 metadata: None,
+                claimed_by: None,
+                claimed_at: None,
+                last_heartbeat: None,
+                progress: 0,
+                stealable: false,
             };
 
             flowforge_core::work_tracking::create_item(&db, &config.work_tracking, &item)?;
@@ -1749,6 +1907,371 @@ impl ToolRegistry {
             }
         }
     }
+
+    // --- Guidance tool implementations ---
+
+    fn guidance_rules(&self, _params: &Value) -> Value {
+        match Self::load_config() {
+            Ok(config) => {
+                let g = &config.guidance;
+                let mut rules = vec![];
+                if g.destructive_ops_gate {
+                    rules.push(json!({"name": "destructive_ops", "enabled": true, "description": "Block dangerous commands"}));
+                }
+                if g.file_scope_gate {
+                    rules.push(json!({"name": "file_scope", "enabled": true, "description": "Block writes to protected paths"}));
+                }
+                if g.diff_size_gate {
+                    rules.push(json!({"name": "diff_size", "enabled": true, "max_lines": g.max_diff_lines, "description": "Ask for large diffs"}));
+                }
+                if g.secrets_gate {
+                    rules.push(json!({"name": "secrets", "enabled": true, "description": "Detect API keys and secrets"}));
+                }
+                for rule in &g.custom_rules {
+                    rules.push(json!({
+                        "name": rule.id,
+                        "enabled": rule.enabled,
+                        "pattern": rule.pattern,
+                        "action": format!("{}", rule.action),
+                        "scope": format!("{}", rule.scope),
+                        "description": rule.description
+                    }));
+                }
+                json!({
+                    "status": "ok",
+                    "gates": rules,
+                    "trust_config": {
+                        "initial": g.trust_initial_score,
+                        "ask_threshold": g.trust_ask_threshold,
+                        "decay_per_hour": g.trust_decay_per_hour
+                    }
+                })
+            }
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn guidance_trust(&self, params: &Value) -> Value {
+        let session_id = params.get("session_id").and_then(|v| v.as_str());
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            let sid = match session_id {
+                Some(s) => s.to_string(),
+                None => db
+                    .get_current_session()?
+                    .map(|s| s.id)
+                    .unwrap_or_else(|| "unknown".to_string()),
+            };
+            Ok((db, sid))
+        }) {
+            Ok((db, sid)) => match db.get_trust_score(&sid) {
+                Ok(Some(t)) => json!({
+                    "status": "ok",
+                    "session_id": sid,
+                    "score": t.score,
+                    "total_checks": t.total_checks,
+                    "denials": t.denials,
+                    "asks": t.asks,
+                    "allows": t.allows
+                }),
+                Ok(None) => json!({
+                    "status": "ok",
+                    "session_id": sid,
+                    "score": null,
+                    "message": "no trust score found"
+                }),
+                Err(e) => json!({"status": "error", "message": format!("{e}")}),
+            },
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn guidance_audit(&self, params: &Value) -> Value {
+        let session_id = params.get("session_id").and_then(|v| v.as_str());
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            let sid = match session_id {
+                Some(s) => s.to_string(),
+                None => db
+                    .get_current_session()?
+                    .map(|s| s.id)
+                    .unwrap_or_else(|| "unknown".to_string()),
+            };
+            let decisions = db.get_gate_decisions(&sid, limit)?;
+            Ok(decisions)
+        }) {
+            Ok(decisions) => {
+                let entries: Vec<Value> = decisions
+                    .iter()
+                    .map(|d| {
+                        json!({
+                            "gate_name": d.gate_name,
+                            "tool_name": d.tool_name,
+                            "action": format!("{}", d.action),
+                            "reason": d.reason,
+                            "risk_level": format!("{}", d.risk_level),
+                            "trust_before": d.trust_before,
+                            "trust_after": d.trust_after,
+                            "timestamp": d.timestamp.to_rfc3339()
+                        })
+                    })
+                    .collect();
+                json!({"status": "ok", "count": entries.len(), "entries": entries})
+            }
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    // --- Work-stealing tool implementations ---
+
+    fn work_claim(&self, params: &Value) -> Value {
+        let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            let session_id = db
+                .get_current_session()?
+                .map(|s| s.id)
+                .unwrap_or_else(|| "unknown".to_string());
+            let claimed = db.claim_work_item(id, &session_id)?;
+            Ok(claimed)
+        }) {
+            Ok(claimed) => json!({"status": "ok", "claimed": claimed, "id": id}),
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn work_release(&self, params: &Value) -> Value {
+        let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            db.release_work_item(id)?;
+            Ok(())
+        }) {
+            Ok(()) => json!({"status": "ok", "id": id}),
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn work_steal(&self, params: &Value) -> Value {
+        let id = params.get("id").and_then(|v| v.as_str());
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            let session_id = db
+                .get_current_session()?
+                .map(|s| s.id)
+                .unwrap_or_else(|| "unknown".to_string());
+            let target = match id {
+                Some(id) => id.to_string(),
+                None => {
+                    let items = db.get_stealable_items(1)?;
+                    items.first().map(|i| i.id.clone()).unwrap_or_default()
+                }
+            };
+            if target.is_empty() {
+                return Ok((false, String::new()));
+            }
+            let stolen = db.steal_work_item(&target, &session_id)?;
+            Ok((stolen, target))
+        }) {
+            Ok((stolen, id)) => json!({"status": "ok", "stolen": stolen, "id": id}),
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn work_heartbeat(&self, params: &Value) -> Value {
+        let progress = params
+            .get("progress")
+            .and_then(|v| v.as_i64())
+            .map(|p| p as i32);
+        let id = params.get("id").and_then(|v| v.as_str());
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            let session_id = db
+                .get_current_session()?
+                .map(|s| s.id)
+                .unwrap_or_else(|| "unknown".to_string());
+            let updated = db.update_heartbeat(&session_id)?;
+            if let (Some(id), Some(progress)) = (id, progress) {
+                db.update_progress(id, progress)?;
+            }
+            Ok(updated)
+        }) {
+            Ok(updated) => json!({"status": "ok", "items_updated": updated}),
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    // --- Plugin tool implementations ---
+
+    fn plugin_list(&self, _params: &Value) -> Value {
+        match Self::load_config().and_then(|config| {
+            let plugins = flowforge_core::plugin::load_all_plugins(&config.plugins)?;
+            Ok((plugins, config))
+        }) {
+            Ok((plugins, config)) => {
+                let entries: Vec<Value> = plugins
+                    .iter()
+                    .map(|p| {
+                        let disabled = config.plugins.disabled.contains(&p.manifest.plugin.name);
+                        json!({
+                            "name": p.manifest.plugin.name,
+                            "version": p.manifest.plugin.version,
+                            "description": p.manifest.plugin.description,
+                            "enabled": !disabled,
+                            "tools": p.manifest.tools.len(),
+                            "hooks": p.manifest.hooks.len(),
+                            "agents": p.manifest.agents.len(),
+                        })
+                    })
+                    .collect();
+                json!({"status": "ok", "count": entries.len(), "plugins": entries})
+            }
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn plugin_info(&self, params: &Value) -> Value {
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        match Self::load_config().and_then(|config| {
+            let plugins = flowforge_core::plugin::load_all_plugins(&config.plugins)?;
+            Ok((plugins, config))
+        }) {
+            Ok((plugins, config)) => {
+                match plugins.iter().find(|p| p.manifest.plugin.name == name) {
+                    Some(p) => {
+                        let disabled = config.plugins.disabled.contains(&p.manifest.plugin.name);
+                        let tools: Vec<Value> = p
+                            .manifest
+                            .tools
+                            .iter()
+                            .map(|t| {
+                                json!({
+                                    "name": t.name,
+                                    "description": t.description,
+                                    "timeout": t.timeout
+                                })
+                            })
+                            .collect();
+                        let hooks: Vec<Value> = p
+                            .manifest
+                            .hooks
+                            .iter()
+                            .map(|h| {
+                                json!({
+                                    "event": h.event,
+                                    "priority": h.priority
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "status": "ok",
+                            "name": name,
+                            "version": p.manifest.plugin.version,
+                            "description": p.manifest.plugin.description,
+                            "enabled": !disabled,
+                            "tools": tools,
+                            "hooks": hooks
+                        })
+                    }
+                    None => {
+                        json!({"status": "error", "message": format!("plugin '{name}' not found")})
+                    }
+                }
+            }
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    // --- Trajectory tool implementations ---
+
+    fn trajectory_list(&self, params: &Value) -> Value {
+        let session_id = params.get("session_id").and_then(|v| v.as_str());
+        let status = params.get("status").and_then(|v| v.as_str());
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            db.list_trajectories(session_id, status, limit)
+        }) {
+            Ok(trajectories) => {
+                let entries: Vec<Value> = trajectories
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "id": t.id,
+                            "session_id": t.session_id,
+                            "status": format!("{}", t.status),
+                            "verdict": t.verdict.as_ref().map(|v| format!("{v}")),
+                            "confidence": t.confidence,
+                            "task_description": t.task_description,
+                            "started_at": t.started_at.to_rfc3339()
+                        })
+                    })
+                    .collect();
+                json!({"status": "ok", "count": entries.len(), "trajectories": entries})
+            }
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn trajectory_get(&self, params: &Value) -> Value {
+        let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            let trajectory = db.get_trajectory(id)?;
+            let steps = db.get_trajectory_steps(id)?;
+            let ratio = db.trajectory_success_ratio(id)?;
+            Ok((trajectory, steps, ratio))
+        }) {
+            Ok((Some(t), steps, ratio)) => {
+                let step_entries: Vec<Value> = steps
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "step_index": s.step_index,
+                            "tool_name": s.tool_name,
+                            "outcome": format!("{}", s.outcome),
+                            "duration_ms": s.duration_ms,
+                            "timestamp": s.timestamp.to_rfc3339()
+                        })
+                    })
+                    .collect();
+                json!({
+                    "status": "ok",
+                    "id": t.id,
+                    "session_id": t.session_id,
+                    "status_field": format!("{}", t.status),
+                    "verdict": t.verdict.as_ref().map(|v| format!("{v}")),
+                    "confidence": t.confidence,
+                    "task_description": t.task_description,
+                    "success_ratio": ratio,
+                    "steps": step_entries
+                })
+            }
+            Ok((None, _, _)) => {
+                json!({"status": "error", "message": "trajectory not found"})
+            }
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn trajectory_judge(&self, params: &Value) -> Value {
+        let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            let judge = flowforge_memory::trajectory::TrajectoryJudge::new(&db, &config.patterns);
+            let result = judge.judge(id)?;
+            Ok(result)
+        }) {
+            Ok(result) => json!({
+                "status": "ok",
+                "verdict": format!("{}", result.verdict),
+                "confidence": result.confidence,
+                "reason": result.reason
+            }),
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1756,9 +2279,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_registry_has_36_tools() {
+    fn test_registry_has_48_tools() {
         let registry = ToolRegistry::new();
-        assert_eq!(registry.list().len(), 36);
+        assert_eq!(registry.list().len(), 48);
     }
 
     #[test]

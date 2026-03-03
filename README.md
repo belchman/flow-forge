@@ -3,19 +3,22 @@
 [![CI](https://github.com/belchman/flow-forge/actions/workflows/ci.yml/badge.svg)](https://github.com/belchman/flow-forge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Agent orchestration for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). FlowForge adds intelligent routing, pattern learning, memory, and team coordination to your Claude Code sessions through hooks, an MCP server, and 60 built-in agents.
+Agent orchestration for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). FlowForge adds intelligent routing, pattern learning, memory, safety guardrails, and team coordination to your Claude Code sessions through hooks, an MCP server, and 60 built-in agents.
 
 ## Features
 
 - **Agent routing** &mdash; routes tasks to the best agent using pattern matching, capability scoring, and learned weights
 - **Pattern learning** &mdash; records what works and improves routing over time via short-term/long-term pattern promotion
+- **Trajectory learning** &mdash; records complete tool-use sequences per session, judges outcomes, distills successful paths into reusable strategies
 - **Memory system** &mdash; SQLite + HNSW vector search for fast, structured, searchable knowledge
-- **Work tracking** &mdash; tracks tasks, epics, and bugs with a full audit trail
+- **Guidance control plane** &mdash; configurable safety gates on all tool uses with trust scoring, SHA-256 audit chain, and automatic rule enforcement
+- **Work tracking** &mdash; tracks tasks, epics, and bugs with a full audit trail; work-stealing redistributes stale/abandoned tasks automatically
 - **Conversation storage** &mdash; ingests Claude Code JSONL transcripts into SQLite for querying past sessions
 - **Checkpoints &amp; forks** &mdash; named snapshots at any point in a conversation; fork a session to branch reasoning
 - **Co-agent mailbox** &mdash; peer agents on the same work item exchange messages, auto-injected into context
-- **13 Claude Code hooks** &mdash; session lifecycle, prompt routing, dangerous command blocking, edit tracking, compaction guidance, team monitoring
-- **36 MCP tools** &mdash; memory, learning, agents, sessions, conversations, checkpoints, forks, mailbox, team, and work tracking
+- **Plugin SDK** &mdash; extend FlowForge with custom tools, hooks, and agents via TOML manifests (no recompilation)
+- **13 Claude Code hooks** &mdash; session lifecycle, guidance gates, trajectory recording, prompt routing, edit tracking, work-stealing heartbeats, team monitoring
+- **48 MCP tools** &mdash; memory, learning, agents, sessions, conversations, checkpoints, forks, mailbox, team, work tracking, guidance, plugins, trajectories
 - **60 built-in agents** &mdash; specialized agents for coding, architecture, security, testing, DevOps, documentation, consensus, and more
 - **tmux team monitor** &mdash; real-time dashboard for multi-agent coordination
 
@@ -64,6 +67,14 @@ flowforge memory search "auth"
 # Track work items
 flowforge work create --type task --title "Fix login flow"
 flowforge work status
+flowforge work claim <id>
+flowforge work stealable
+
+# Guidance control plane
+flowforge guidance rules
+flowforge guidance trust
+flowforge guidance audit
+flowforge guidance verify
 
 # Conversation history and checkpoints
 flowforge session history
@@ -74,8 +85,14 @@ flowforge session fork --checkpoint "before-refactor"
 flowforge mailbox send --work-item <id> --from agent-a "found the bug"
 flowforge mailbox read
 
-# Check learning progress
+# Trajectory learning
 flowforge learn stats
+flowforge learn trajectories
+flowforge learn trajectory <id>
+
+# Plugin management
+flowforge plugin list
+flowforge plugin info <name>
 
 # Start the tmux team monitor
 flowforge tmux start
@@ -89,10 +106,10 @@ flowforge status
 ```
 flowforge (single binary, ~7.5 MB)
 ├── flowforge-cli      CLI commands + 13 hook handlers
-├── flowforge-core     Config, types, hook I/O, transcript parser, work tracking
-├── flowforge-memory   SQLite DB, HNSW vectors, pattern learning, conversations
-├── flowforge-agents   60 built-in agents, registry, router
-├── flowforge-mcp      MCP server (36 tools over JSON-RPC 2.0)
+├── flowforge-core     Config, types, hook I/O, guidance engine, plugin loader, work tracking
+├── flowforge-memory   SQLite DB, HNSW vectors, pattern learning, trajectory judge
+├── flowforge-agents   60 built-in agents, registry, router (+ plugin agents)
+├── flowforge-mcp      MCP server (48 tools over JSON-RPC 2.0)
 └── flowforge-tmux     tmux team monitor
 ```
 
@@ -102,36 +119,122 @@ FlowForge wires into all 13 Claude Code hook events:
 
 | Event | What FlowForge Does |
 |-------|---------------------|
-| SessionStart | Creates session record, stores transcript path, syncs work items |
-| SessionEnd | Ingests transcript, ends session, consolidates patterns |
-| UserPromptSubmit | Routes to best agent, injects context + mailbox messages |
-| PreToolUse | Blocks dangerous Bash commands, tracks command count |
-| PostToolUse | Tracks file edits (Write/Edit/MultiEdit) |
-| PostToolUseFailure | Records error patterns for learning |
+| SessionStart | Creates session record, initializes trust score, starts trajectory recording, syncs work items |
+| SessionEnd | Closes trajectory, runs judgment + distillation, ingests transcript, consolidates patterns |
+| UserPromptSubmit | Routes to best agent, sets trajectory task description, injects context + mailbox messages |
+| PreToolUse | Runs 5 guidance gates on ALL tools, executes plugin hooks, updates work heartbeats, blocks dangerous commands |
+| PostToolUse | Records trajectory step (success), tracks file edits |
+| PostToolUseFailure | Records trajectory step (failure), records error patterns for learning |
 | PreCompact | Injects guidance before context compaction |
 | SubagentStart | Updates monitor, stores transcript path, assigns work to agent |
 | SubagentStop | Ingests agent transcript, extracts patterns from output |
-| TeammateIdle | Updates monitor status |
-| TaskCompleted | Updates routing weights (learning) |
+| TeammateIdle | Detects stale work items, marks them stealable, updates monitor |
+| TaskCompleted | Releases work claims, links trajectory to work item, updates routing weights |
 | Stop | Ends active session |
 | Notification | Logs to audit trail |
 
 ### MCP Tools
 
-When Claude connects to the FlowForge MCP server, 36 tools become available:
+When Claude connects to the FlowForge MCP server, 48 tools become available:
 
 | Category | Tools |
 |----------|-------|
 | Memory | `memory_get`, `memory_set`, `memory_delete`, `memory_list`, `memory_search`, `memory_import` |
 | Learning | `learning_store`, `learning_search`, `learning_feedback`, `learning_stats` |
 | Agents | `agents_list`, `agents_info`, `agents_route` |
-| Sessions | `session_status`, `session_history`, `session_metrics` |
+| Sessions | `session_status`, `session_history`, `session_metrics`, `session_agents` |
 | Conversations | `conversation_history`, `conversation_search`, `conversation_ingest` |
 | Checkpoints | `checkpoint_create`, `checkpoint_list`, `checkpoint_get` |
 | Forks | `session_fork`, `session_forks`, `session_lineage` |
 | Mailbox | `mailbox_send`, `mailbox_read`, `mailbox_history`, `mailbox_agents` |
 | Team | `team_status`, `team_log` |
-| Work | `work_create`, `work_list`, `work_update`, `work_log` |
+| Work | `work_create`, `work_list`, `work_update`, `work_log`, `work_claim`, `work_release`, `work_steal`, `work_heartbeat` |
+| Guidance | `guidance_rules`, `guidance_trust`, `guidance_audit` |
+| Plugins | `plugin_list`, `plugin_info` |
+| Trajectories | `trajectory_list`, `trajectory_get`, `trajectory_judge` |
+
+### Guidance Control Plane
+
+The guidance engine evaluates every tool use against 5 configurable gates:
+
+1. **Destructive ops** &mdash; blocks `rm -rf /`, `DROP TABLE`, `git reset --hard`, fork bombs, etc.
+2. **Secrets detection** &mdash; denies tool inputs containing AWS keys, bearer tokens, private keys, API secrets
+3. **File scope** &mdash; blocks writes to `.env`, `*.key`, `*.pem`, `.ssh/*`, and custom protected paths
+4. **Custom rules** &mdash; user-defined regex rules in `config.toml` scoped to tool, command, or file
+5. **Diff size** &mdash; asks for confirmation on edits exceeding `max_diff_lines`
+
+Trust scoring adjusts per session: denials lower trust, clean passes raise it. Above the threshold, `ask` auto-promotes to `allow`. All decisions are logged with SHA-256 hash chains for tamper-evident auditing.
+
+### Work-Stealing
+
+When agents stall or die, their work items are automatically redistributed:
+
+- Every tool use sends a heartbeat for claimed work items
+- `TeammateIdle` hook detects items with stale heartbeats (configurable threshold)
+- Stale items are marked stealable; abandoned items are auto-released back to pending
+- Other agents can steal stealable items via `flowforge work steal`
+
+### Plugin SDK
+
+Extend FlowForge without recompiling:
+
+```
+.flowforge/plugins/my-plugin/
+├── plugin.toml          # Manifest: tools, hooks, agents
+├── scripts/
+│   └── my_tool.py       # Tool: reads JSON from stdin, writes JSON to stdout
+└── agents/
+    └── specialist.md    # Agent definition (markdown)
+```
+
+```toml
+[plugin]
+name = "my-plugin"
+version = "0.1.0"
+
+[[tools]]
+name = "my_custom_tool"
+description = "Does a thing"
+command = "python3 scripts/my_tool.py"
+timeout = 5000
+
+[[hooks]]
+event = "PreToolUse"
+command = "bash scripts/check.sh"
+priority = 10
+
+[[agents]]
+path = "agents/specialist.md"
+```
+
+### Trajectory Learning
+
+FlowForge records the complete tool-use sequence for every session:
+
+1. **Recording** &mdash; each tool use is logged as a step with SHA-256 hashed input
+2. **Judgment** &mdash; at session end, trajectories are scored: `success_ratio * 0.6 + work_item_factor * 0.3 + pattern_match * 0.1`
+3. **Distillation** &mdash; successful trajectories are converted to reusable strategy patterns stored in HNSW
+4. **Consolidation** &mdash; old failures are pruned, similar successes are merged
+
+## CLI Reference
+
+| Command | Description |
+|---------|-------------|
+| `flowforge init --project` | Initialize FlowForge in the current project |
+| `flowforge init --global` | Set up global config |
+| `flowforge status` | Show overall FlowForge status |
+| `flowforge agent list\|info\|search` | Manage agents |
+| `flowforge route "<task>"` | Route a task to the best agent |
+| `flowforge memory get\|set\|delete\|list\|search` | Memory operations |
+| `flowforge session current\|list\|metrics\|agents\|history\|ingest\|checkpoint\|checkpoints\|fork\|forks` | Session management |
+| `flowforge learn store\|search\|stats\|trajectories\|trajectory\|judge` | Pattern learning + trajectories |
+| `flowforge work create\|list\|update\|close\|sync\|status\|log\|claim\|release\|stealable\|steal\|load` | Work tracking + work-stealing |
+| `flowforge mailbox send\|read\|history\|agents` | Co-agent mailbox |
+| `flowforge guidance rules\|trust\|audit\|verify` | Guidance control plane |
+| `flowforge plugin list\|info\|enable\|disable` | Plugin management |
+| `flowforge tmux start\|update\|stop\|status` | tmux team monitor |
+| `flowforge mcp serve` | Start the MCP server |
+| `flowforge statusline` | Output status line for Claude Code |
 
 ## Testing
 
@@ -178,14 +281,15 @@ cargo fmt --all --check
 │   └── custom/              database, project, python, rust specialists
 ├── crates/
 │   ├── flowforge-cli/       Binary entry point, commands, hooks
-│   ├── flowforge-core/      Config, types, hook I/O
-│   ├── flowforge-memory/    SQLite, vectors, patterns
+│   ├── flowforge-core/      Config, types, guidance engine, plugin loader, work tracking
+│   ├── flowforge-memory/    SQLite, vectors, patterns, trajectory judge
 │   ├── flowforge-agents/    Agent loader, registry, router
-│   ├── flowforge-mcp/       MCP server
+│   ├── flowforge-mcp/       MCP server (48 tools)
 │   └── flowforge-tmux/      tmux monitor
 ├── .claude/settings.json    Claude Code hook wiring
 ├── .mcp.json                MCP server registration
 ├── CLAUDE.md                Agent orchestration instructions
+├── CONTRIBUTING.md          Development guide: what to update when changing FlowForge
 ├── SETUP.md                 Detailed setup guide
 └── setup.sh                 One-command setup script
 ```

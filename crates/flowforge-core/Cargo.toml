@@ -13,3 +13,4 @@ uuid = { workspace = true }
 dirs = { workspace = true }
 tracing = { workspace = true }
 regex = { workspace = true }
+sha2 = { workspace = true }

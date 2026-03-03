@@ -2,6 +2,7 @@ pub mod db;
 pub mod embedding;
 pub mod hnsw;
 pub mod patterns;
+pub mod trajectory;
 
 pub use db::MemoryDb;
 pub use embedding::Embedding;

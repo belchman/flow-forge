@@ -43,6 +43,32 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Release work item claim on completion
+    if config.work_tracking.work_stealing.enabled {
+        if let Some(task_id) = &input.task_id {
+            let db_path = config.db_path();
+            if db_path.exists() {
+                if let Ok(db) = MemoryDb::open(&db_path) {
+                    let _ = db.release_work_item(task_id);
+                }
+            }
+        }
+    }
+
+    // Link trajectory to completed work item
+    if let Some(task_id) = &input.task_id {
+        let db_path = config.db_path();
+        if db_path.exists() {
+            if let Ok(db) = MemoryDb::open(&db_path) {
+                if let Ok(Some(session)) = db.get_current_session() {
+                    if let Ok(Some(trajectory)) = db.get_active_trajectory(&session.id) {
+                        let _ = db.link_trajectory_work_item(&trajectory.id, task_id);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -20,6 +20,7 @@ fn init_project() -> Result<()> {
     let project_dir = FlowForgeConfig::project_dir();
     std::fs::create_dir_all(&project_dir)?;
     std::fs::create_dir_all(project_dir.join("agents"))?;
+    std::fs::create_dir_all(".flowforge/plugins")?;
 
     // Create default config
     let config = FlowForgeConfig::default();
@@ -110,7 +111,6 @@ fn flowforge_hooks() -> serde_json::Value {
     serde_json::json!({
         "PreToolUse": [
             {
-                "matcher": "Bash",
                 "hooks": [{
                     "type": "command",
                     "command": format!("{bin} hook pre-tool-use"),
@@ -120,7 +120,6 @@ fn flowforge_hooks() -> serde_json::Value {
         ],
         "PostToolUse": [
             {
-                "matcher": "Write|Edit|MultiEdit",
                 "hooks": [{
                     "type": "command",
                     "command": format!("{bin} hook post-tool-use"),

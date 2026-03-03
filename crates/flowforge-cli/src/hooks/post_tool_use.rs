@@ -2,6 +2,7 @@ use chrono::Utc;
 use flowforge_core::hook::{self, PostToolUseInput};
 use flowforge_core::{EditRecord, FlowForgeConfig, Result};
 use flowforge_memory::MemoryDb;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub fn run() -> Result<()> {
@@ -13,6 +14,28 @@ pub fn run() -> Result<()> {
             record_edit(&input)?;
         }
         _ => {}
+    }
+
+    // Record trajectory step (if trajectory is active)
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db_path = config.db_path();
+    if db_path.exists() {
+        if let Ok(db) = MemoryDb::open(&db_path) {
+            if let Ok(Some(session)) = db.get_current_session() {
+                if let Ok(Some(trajectory)) = db.get_active_trajectory(&session.id) {
+                    // Hash tool_input for privacy
+                    let input_str = serde_json::to_string(&input.tool_input).unwrap_or_default();
+                    let input_hash = format!("{:x}", Sha256::digest(input_str.as_bytes()));
+                    let _ = db.record_trajectory_step(
+                        &trajectory.id,
+                        &input.tool_name,
+                        Some(&input_hash),
+                        flowforge_core::trajectory::StepOutcome::Success,
+                        None,
+                    );
+                }
+            }
+        }
     }
 
     Ok(())

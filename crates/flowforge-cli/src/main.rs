@@ -80,6 +80,16 @@ enum Commands {
         #[command(subcommand)]
         action: MailboxAction,
     },
+    /// Guidance control plane management
+    Guidance {
+        #[command(subcommand)]
+        action: GuidanceAction,
+    },
+    /// Plugin management
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -213,6 +223,28 @@ enum LearnAction {
     },
     /// Show learning statistics
     Stats,
+    /// List recorded trajectories
+    Trajectories {
+        /// Filter by session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Filter by status (recording, completed, failed, judged)
+        #[arg(long)]
+        status: Option<String>,
+        /// Max results
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Show trajectory details
+    Trajectory {
+        /// Trajectory ID
+        id: String,
+    },
+    /// Judge a trajectory
+    Judge {
+        /// Trajectory ID
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -298,6 +330,25 @@ enum WorkAction {
         #[arg(long)]
         since: Option<String>,
     },
+    /// Claim a work item
+    Claim {
+        /// Work item ID
+        id: String,
+    },
+    /// Release a claimed work item
+    Release {
+        /// Work item ID
+        id: String,
+    },
+    /// List stealable work items
+    Stealable,
+    /// Steal a stealable work item
+    Steal {
+        /// Work item ID (steals highest priority if omitted)
+        id: Option<String>,
+    },
+    /// Show work distribution across agents
+    Load,
 }
 
 #[derive(Subcommand)]
@@ -332,6 +383,54 @@ enum MailboxAction {
     Agents {
         /// Work item ID
         work_item_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GuidanceAction {
+    /// List all guidance rules and gates
+    Rules,
+    /// Show trust score for current or specified session
+    Trust {
+        /// Session ID (defaults to current)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Show audit trail of gate decisions
+    Audit {
+        /// Session ID (defaults to current)
+        #[arg(long)]
+        session: Option<String>,
+        /// Max results
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Verify audit hash chain integrity
+    Verify {
+        /// Session ID (defaults to current)
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginAction {
+    /// List installed plugins
+    List,
+    /// Show plugin details
+    Info {
+        /// Plugin name
+        name: String,
+    },
+    /// Enable a plugin
+    Enable {
+        /// Plugin name
+        name: String,
+    },
+    /// Disable a plugin
+    Disable {
+        /// Plugin name
+        name: String,
     },
 }
 
@@ -425,6 +524,13 @@ fn main() {
             LearnAction::Store { content, category } => commands::learn::store(&content, &category),
             LearnAction::Search { query, limit } => commands::learn::search(&query, limit),
             LearnAction::Stats => commands::learn::stats(),
+            LearnAction::Trajectories {
+                session,
+                status,
+                limit,
+            } => commands::learn::trajectories(session.as_deref(), status.as_deref(), limit),
+            LearnAction::Trajectory { id } => commands::learn::trajectory(&id),
+            LearnAction::Judge { id } => commands::learn::judge(&id),
         },
         Commands::Agent { action } => match action {
             AgentAction::List => commands::agent::list(),
@@ -463,6 +569,11 @@ fn main() {
             WorkAction::Sync => commands::work::sync(),
             WorkAction::Status => commands::work::status(),
             WorkAction::Log { limit, since } => commands::work::log(limit, since.as_deref()),
+            WorkAction::Claim { id } => commands::work::claim(&id),
+            WorkAction::Release { id } => commands::work::release(&id),
+            WorkAction::Stealable => commands::work::stealable(),
+            WorkAction::Steal { id } => commands::work::steal(id.as_deref()),
+            WorkAction::Load => commands::work::load(),
         },
         Commands::Mailbox { action } => match action {
             MailboxAction::Send {
@@ -477,6 +588,20 @@ fn main() {
                 limit,
             } => commands::mailbox::history(&work_item_id, limit),
             MailboxAction::Agents { work_item_id } => commands::mailbox::agents(&work_item_id),
+        },
+        Commands::Guidance { action } => match action {
+            GuidanceAction::Rules => commands::guidance::rules(),
+            GuidanceAction::Trust { session } => commands::guidance::trust(session.as_deref()),
+            GuidanceAction::Audit { session, limit } => {
+                commands::guidance::audit(session.as_deref(), limit)
+            }
+            GuidanceAction::Verify { session } => commands::guidance::verify(session.as_deref()),
+        },
+        Commands::Plugin { action } => match action {
+            PluginAction::List => commands::plugin::list(),
+            PluginAction::Info { name } => commands::plugin::info(&name),
+            PluginAction::Enable { name } => commands::plugin::enable(&name),
+            PluginAction::Disable { name } => commands::plugin::disable(&name),
         },
     };
 

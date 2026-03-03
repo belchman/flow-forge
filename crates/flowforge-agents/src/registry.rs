@@ -73,6 +73,25 @@ impl AgentRegistry {
             }
         }
 
+        // 4. Plugin agents
+        let plugins_config = flowforge_core::config::PluginsConfig::default();
+        if let Ok(plugins) = flowforge_core::plugin::load_all_plugins(&plugins_config) {
+            for plugin in &plugins {
+                for agent_ref in &plugin.manifest.agents {
+                    let agent_path = plugin.dir.join(&agent_ref.path);
+                    if agent_path.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&agent_path) {
+                            if let Ok(mut agent) = loader::parse_agent_def(&content) {
+                                agent.source =
+                                    AgentSource::Plugin(plugin.manifest.plugin.name.clone());
+                                registry.agents.insert(agent.name.clone(), agent);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(registry)
     }
 

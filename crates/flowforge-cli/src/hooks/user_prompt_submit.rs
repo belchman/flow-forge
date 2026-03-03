@@ -29,6 +29,19 @@ pub fn run() -> Result<()> {
         None
     };
 
+    // Set trajectory task description from first user prompt
+    if let Some(ref db) = db {
+        if let Ok(Some(session)) = db.get_current_session() {
+            if let Ok(Some(trajectory)) = db.get_active_trajectory(&session.id) {
+                if trajectory.task_description.is_none() {
+                    // Use first ~200 chars of prompt as task description
+                    let desc: String = input.prompt.chars().take(200).collect();
+                    let _ = db.set_trajectory_task_description(&trajectory.id, &desc);
+                }
+            }
+        }
+    }
+
     // Load learned weights once from the shared DB connection (A10)
     let learned_weights = if let Some(ref db) = db {
         load_learned_weights_from_db(db)

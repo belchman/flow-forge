@@ -1,9 +1,11 @@
 pub mod agent;
+pub mod guidance;
 pub mod init;
 pub mod learn;
 pub mod mailbox;
 pub mod mcp;
 pub mod memory;
+pub mod plugin;
 pub mod route;
 pub mod session;
 pub mod status;

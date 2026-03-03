@@ -1,5 +1,6 @@
 use chrono::Utc;
 use flowforge_core::hook::{self, ContextOutput, SessionStartInput};
+use flowforge_core::trajectory::{Trajectory, TrajectoryStatus};
 use flowforge_core::{FlowForgeConfig, Result, SessionInfo};
 use flowforge_memory::MemoryDb;
 use uuid::Uuid;
@@ -41,6 +42,28 @@ pub fn run() -> Result<()> {
     };
 
     db.create_session(&session)?;
+
+    // Initialize trust score for guidance
+    if config.guidance.enabled {
+        let _ = db.create_trust_score(&session.id, config.guidance.trust_initial_score);
+    }
+
+    // Create trajectory for this session
+    let trajectory = Trajectory {
+        id: Uuid::new_v4().to_string(),
+        session_id: session.id.clone(),
+        work_item_id: None,
+        agent_name: None,
+        task_description: None,
+        status: TrajectoryStatus::Recording,
+        started_at: Utc::now(),
+        ended_at: None,
+        verdict: None,
+        confidence: None,
+        metadata: None,
+        embedding_id: None,
+    };
+    let _ = db.create_trajectory(&trajectory);
 
     // Build context with session info and stats
     let mut context_parts = vec![format!("[FlowForge] Session {} started.", &session_id[..8])];

@@ -49,6 +49,11 @@ pub fn create(
         completed_at: None,
         session_id: None,
         metadata: None,
+        claimed_by: None,
+        claimed_at: None,
+        last_heartbeat: None,
+        progress: 0,
+        stealable: false,
     };
 
     work_tracking::create_item(&db, &config.work_tracking, &item)?;
@@ -291,6 +296,173 @@ fn parse_since_date(s: &str) -> Result<DateTime<Utc>> {
         "Invalid date '{}'. Use YYYY-MM-DD, Nd (days), Nw (weeks), or Nh (hours).",
         s
     )))
+}
+
+pub fn claim(id: &str) -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    let session_id = db
+        .get_current_session()?
+        .map(|s| s.id)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if db.claim_work_item(id, &session_id)? {
+        println!(
+            "{} Claimed work item {}",
+            "✓".green(),
+            &id[..8.min(id.len())]
+        );
+    } else {
+        println!(
+            "{} Could not claim work item {} (already claimed?)",
+            "✗".red(),
+            &id[..8.min(id.len())]
+        );
+    }
+    Ok(())
+}
+
+pub fn release(id: &str) -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    db.release_work_item(id)?;
+    println!(
+        "{} Released work item {}",
+        "✓".green(),
+        &id[..8.min(id.len())]
+    );
+    Ok(())
+}
+
+pub fn stealable() -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    let items = db.get_stealable_items(20)?;
+
+    if items.is_empty() {
+        println!("No stealable work items.");
+        return Ok(());
+    }
+
+    println!("{} ({} items)", "Stealable Work Items".bold(), items.len());
+    for item in &items {
+        println!(
+            "  {} {} — {} (priority: {}, progress: {}%)",
+            "•".yellow(),
+            &item.id[..8.min(item.id.len())],
+            item.title,
+            item.priority,
+            item.progress
+        );
+        if let Some(ref claimed) = item.claimed_by {
+            println!("    Claimed by: {}", &claimed[..8.min(claimed.len())]);
+        }
+    }
+    Ok(())
+}
+
+pub fn steal(id: Option<&str>) -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    let session_id = db
+        .get_current_session()?
+        .map(|s| s.id)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let target_id = match id {
+        Some(id) => id.to_string(),
+        None => {
+            let items = db.get_stealable_items(1)?;
+            match items.first() {
+                Some(item) => item.id.clone(),
+                None => {
+                    println!("No stealable work items available.");
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    if db.steal_work_item(&target_id, &session_id)? {
+        println!(
+            "{} Stole work item {}",
+            "✓".green(),
+            &target_id[..8.min(target_id.len())]
+        );
+    } else {
+        println!(
+            "{} Could not steal work item {}",
+            "✗".red(),
+            &target_id[..8.min(target_id.len())]
+        );
+    }
+    Ok(())
+}
+
+pub fn load() -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    // Show work distribution
+    let in_progress = db.list_work_items(&WorkFilter {
+        status: Some("in_progress".to_string()),
+        ..Default::default()
+    })?;
+
+    println!("{}", "Work Distribution".bold());
+
+    if in_progress.is_empty() {
+        println!("  No in-progress work items.");
+        return Ok(());
+    }
+
+    // Group by assignee/claimed_by
+    let mut by_agent: std::collections::HashMap<String, Vec<&WorkItem>> =
+        std::collections::HashMap::new();
+    for item in &in_progress {
+        let agent = item
+            .claimed_by
+            .as_deref()
+            .or(item.assignee.as_deref())
+            .unwrap_or("unassigned");
+        by_agent.entry(agent.to_string()).or_default().push(item);
+    }
+
+    for (agent, items) in &by_agent {
+        let label = if agent.len() > 8 { &agent[..8] } else { agent };
+        println!("  {} ({} items):", label.cyan(), items.len());
+        for item in items {
+            let stale = if item.stealable {
+                " [stealable]".yellow().to_string()
+            } else {
+                String::new()
+            };
+            println!(
+                "    • {} — {} ({}%){}",
+                &item.id[..8.min(item.id.len())],
+                item.title,
+                item.progress,
+                stale
+            );
+        }
+    }
+
+    // Show stealable count
+    let stealable_count = db.get_stealable_items(100)?.len();
+    if stealable_count > 0 {
+        println!();
+        println!(
+            "  {} {} stealable items available",
+            "⚠".yellow(),
+            stealable_count
+        );
+    }
+
+    Ok(())
 }
 
 /// Resolve a partial ID to a full work item ID.

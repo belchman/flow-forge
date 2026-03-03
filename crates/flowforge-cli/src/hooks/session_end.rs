@@ -56,6 +56,26 @@ pub fn run() -> Result<()> {
     // Push FlowForge-only items to external backend (C4)
     let _ = flowforge_core::work_tracking::push_to_backend(&db, &config.work_tracking);
 
+    // Close active trajectory, judge it, distill if successful
+    if let Some(ref session) = current_session {
+        if let Ok(Some(trajectory)) = db.get_active_trajectory(&session.id) {
+            use flowforge_core::trajectory::TrajectoryStatus;
+            let _ = db.end_trajectory(&trajectory.id, TrajectoryStatus::Completed);
+
+            // Judge and distill
+            use flowforge_memory::trajectory::TrajectoryJudge;
+            let judge = TrajectoryJudge::new(&db, &config.patterns);
+            if let Ok(result) = judge.judge(&trajectory.id) {
+                if result.verdict == flowforge_core::trajectory::TrajectoryVerdict::Success {
+                    let _ = judge.distill(&trajectory.id);
+                }
+            }
+
+            // Consolidate old trajectories
+            let _ = judge.consolidate();
+        }
+    }
+
     // Run pattern consolidation
     if config.hooks.learning {
         let store = flowforge_memory::PatternStore::new(&db, &config.patterns);
