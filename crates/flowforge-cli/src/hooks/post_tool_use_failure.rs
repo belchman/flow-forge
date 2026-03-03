@@ -4,7 +4,8 @@ use flowforge_memory::MemoryDb;
 use sha2::{Digest, Sha256};
 
 pub fn run() -> Result<()> {
-    let input: PostToolUseFailureInput = hook::parse_stdin()?;
+    let v = hook::parse_stdin_value()?;
+    let input = PostToolUseFailureInput::from_value(&v)?;
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
 
     // Record failed tool use for error pattern tracking

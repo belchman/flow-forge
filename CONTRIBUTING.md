@@ -8,7 +8,7 @@ After any change, always run:
 
 ```bash
 cargo build --workspace              # Must compile with 0 warnings
-cargo test --workspace               # All 88 tests must pass
+cargo test --workspace               # All 102 tests must pass
 cargo clippy --workspace -- -D warnings  # Must be clean
 cargo fmt --all --check              # Must be formatted
 ```
@@ -67,7 +67,9 @@ Hooks are the main integration point between Claude Code and FlowForge. They run
 
 3. **Keep hooks fast**: hooks block Claude Code. Target <50ms for PreToolUse, <200ms for others. Use `run_safe()` wrapper so failures don't break the session.
 
-4. **Update documentation**:
+4. **Run `flowforge test-hooks`** to verify all 13 hooks pass with realistic Claude Code payloads (includes extra fields like `hook_event_name`, `permission_mode`, `tool_use_id`).
+
+5. **Update documentation**:
    - `README.md` — Hooks table
    - `SETUP.md` — Hook Events table
 

@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub fn run() -> Result<()> {
-    let input: PostToolUseInput = hook::parse_stdin()?;
+    let v = hook::parse_stdin_value()?;
+    let input = PostToolUseInput::from_value(&v)?;
 
     // Record edits for Write, Edit, MultiEdit operations
     match input.tool_name.as_str() {

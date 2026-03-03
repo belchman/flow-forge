@@ -2,10 +2,6 @@
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
-  "statusLine": {
-    "type": "command",
-    "command": "flowforge statusline"
-  },
   "hooks": {
     "Notification": [
       {
@@ -66,16 +62,6 @@
         "hooks": [
           {
             "command": "flowforge hook session-end",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "flowforge hook session-start",
             "type": "command"
           }
         ]
@@ -142,5 +128,9 @@
         ]
       }
     ]
+  },
+  "statusLine": {
+    "command": "flowforge statusline",
+    "type": "command"
   }
 }

@@ -10,5 +10,6 @@ pub mod route;
 pub mod session;
 pub mod status;
 pub mod statusline;
+pub mod test_hooks;
 pub mod tmux;
 pub mod work;

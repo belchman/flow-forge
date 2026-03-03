@@ -5,7 +5,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 pub fn run() -> Result<()> {
-    let input: PreToolUseInput = hook::parse_stdin()?;
+    let v = hook::parse_stdin_value()?;
+    let input = PreToolUseInput::from_value(&v)?;
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
     let db_path = config.db_path();
 

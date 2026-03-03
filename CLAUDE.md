@@ -71,6 +71,11 @@ FlowForge uses BOTH a fast Rust-based memory system AND Claude's native auto-mem
 - Use `flowforge learn judge <id>` to manually judge a trajectory
 - MCP tools: `trajectory_list`, `trajectory_get`, `trajectory_judge`
 
+### Building & Installing
+- After any code change, rebuild and reinstall: `cargo build --release && rm -f ~/.cargo/bin/flowforge && cp target/release/flowforge ~/.cargo/bin/flowforge`
+- **Important:** Always `rm` the old binary before copying. macOS caches in-place overwrites, causing the stale binary to hang indefinitely. All hooks will silently fail/timeout if this happens.
+- Or use `./setup.sh` which handles this automatically.
+
 ### tmux Monitor
 - Run `flowforge tmux start` for real-time team monitoring
 - The monitor updates automatically via hooks

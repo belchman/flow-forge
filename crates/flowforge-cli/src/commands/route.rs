@@ -20,7 +20,7 @@ pub fn run(task: &str) -> Result<()> {
         }
     }
 
-    let results = router.route(task, &agents, &learned_weights);
+    let results = router.route(task, &agents, &learned_weights, None);
 
     println!("{} \"{}\"", "Routing:".bold(), task);
     println!("{}", "─".repeat(60));
@@ -38,13 +38,14 @@ pub fn run(task: &str) -> Result<()> {
             " ".to_string()
         };
         println!(
-            "{} {:<20} {:.0}%  (pattern: {:.0}%, cap: {:.0}%, learned: {:.0}%, priority: {:.0}%)",
+            "{} {:<20} {:.0}%  (pattern: {:.0}%, cap: {:.0}%, learned: {:.0}%, context: {:.0}%, priority: {:.0}%)",
             marker,
             result.agent_name.cyan(),
             result.confidence * 100.0,
             result.breakdown.pattern_score * 100.0,
             result.breakdown.capability_score * 100.0,
             result.breakdown.learned_score * 100.0,
+            result.breakdown.context_score * 100.0,
             result.breakdown.priority_score * 100.0,
         );
     }

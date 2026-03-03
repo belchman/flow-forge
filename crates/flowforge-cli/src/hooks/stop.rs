@@ -4,7 +4,8 @@ use flowforge_core::{FlowForgeConfig, Result};
 use flowforge_memory::MemoryDb;
 
 pub fn run() -> Result<()> {
-    let _input: StopInput = hook::parse_stdin()?;
+    let v = hook::parse_stdin_value()?;
+    let _input = StopInput::from_value(&v)?;
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
 
     let db_path = config.db_path();

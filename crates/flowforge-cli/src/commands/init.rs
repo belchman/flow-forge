@@ -158,7 +158,8 @@ fn flowforge_hooks() -> serde_json::Value {
             {
                 "hooks": [{
                     "type": "command",
-                    "command": format!("{bin} hook session-start")
+                    "command": format!("{bin} hook session-start"),
+                    "timeout": 10000
                 }]
             }
         ],
@@ -265,45 +266,51 @@ fn write_settings_json() -> Result<()> {
         (hooks.as_object_mut(), ff_hooks.as_object())
     {
         for (event_name, ff_hook_array) in ff_hooks_obj {
-            // Check if this event already has FlowForge hooks
-            let has_flowforge = existing_hooks
-                .get(event_name)
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter().any(|entry| {
-                        entry
-                            .get("hooks")
-                            .and_then(|h| h.as_array())
-                            .map(|hooks| {
-                                hooks.iter().any(|h| {
-                                    h.get("command")
-                                        .and_then(|c| c.as_str())
-                                        .map(|c| {
-                                            c.starts_with("flowforge") || c.contains("/flowforge")
-                                        })
-                                        .unwrap_or(false)
-                                })
+            if let Some(existing_arr) = existing_hooks
+                .get_mut(event_name)
+                .and_then(|v| v.as_array_mut())
+            {
+                // Remove any existing FlowForge hook entries so we can replace them
+                // with the current absolute-path version
+                existing_arr.retain(|entry| {
+                    !entry
+                        .get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|hooks| {
+                            hooks.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|c| c.starts_with("flowforge") || c.contains("/flowforge"))
+                                    .unwrap_or(false)
                             })
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-
-            if !has_flowforge {
-                // Append FlowForge hooks to existing hooks for this event
-                let event_hooks = existing_hooks
-                    .entry(event_name)
-                    .or_insert_with(|| serde_json::json!([]));
-                if let (Some(existing_arr), Some(ff_arr)) =
-                    (event_hooks.as_array_mut(), ff_hook_array.as_array())
-                {
+                        })
+                        .unwrap_or(false)
+                });
+                // Append fresh FlowForge hooks with absolute path
+                if let Some(ff_arr) = ff_hook_array.as_array() {
                     for item in ff_arr {
                         existing_arr.push(item.clone());
                     }
                 }
+            } else {
+                // No existing hooks for this event, insert directly
+                existing_hooks.insert(event_name.clone(), ff_hook_array.clone());
             }
         }
     }
+
+    // Update statusLine to use absolute binary path
+    let bin = flowforge_bin_path();
+    settings
+        .as_object_mut()
+        .expect("settings is guaranteed to be an object")
+        .insert(
+            "statusLine".to_string(),
+            serde_json::json!({
+                "type": "command",
+                "command": format!("{bin} statusline")
+            }),
+        );
 
     let content = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&settings_path, content)?;

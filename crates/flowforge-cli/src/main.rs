@@ -59,7 +59,11 @@ enum Commands {
         task: String,
     },
     /// Output status line for Claude Code terminal display
-    Statusline,
+    Statusline {
+        /// Show legend explaining all statusline symbols
+        #[arg(long)]
+        legend: bool,
+    },
     /// tmux monitor management
     Tmux {
         #[command(subcommand)]
@@ -89,6 +93,15 @@ enum Commands {
     Plugin {
         #[command(subcommand)]
         action: PluginAction,
+    },
+    /// Test all hooks with realistic Claude Code payloads
+    TestHooks {
+        /// Filter to a specific hook event (e.g. "pre-tool-use", "session-start")
+        #[arg(long)]
+        event: Option<String>,
+        /// Show stdin/stdout/stderr/timing details for each hook
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -435,14 +448,24 @@ enum PluginAction {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+
+    // Only enable tracing for non-hook commands. Any stderr output during
+    // hook execution causes Claude Code to display a hook error in the TUI.
+    let is_hook = matches!(cli.command, Commands::Hook { .. });
+    if is_hook {
+        // Suppress default panic output to stderr — Claude Code treats any
+        // stderr as a hook error. Our run_safe wrapper catches panics and
+        // logs them to .flowforge/hook-errors.log instead.
+        std::panic::set_hook(Box::new(|_| {}));
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
     let result = match cli.command {
         Commands::Init { project, global } => commands::init::run(project, global),
@@ -481,7 +504,13 @@ fn main() {
             MemoryAction::List { namespace } => commands::memory::list(&namespace),
             MemoryAction::Search { query, limit } => commands::memory::search(&query, limit),
         },
-        Commands::Statusline => commands::statusline::run(),
+        Commands::Statusline { legend } => {
+            if legend {
+                commands::statusline::print_legend()
+            } else {
+                commands::statusline::run()
+            }
+        }
         Commands::Session { action } => match action {
             SessionAction::Current => commands::session::current(),
             SessionAction::List { limit } => commands::session::list(limit),
@@ -603,10 +632,15 @@ fn main() {
             PluginAction::Enable { name } => commands::plugin::enable(&name),
             PluginAction::Disable { name } => commands::plugin::disable(&name),
         },
+        Commands::TestHooks { event, verbose } => {
+            commands::test_hooks::run(event.as_deref(), verbose)
+        }
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {e}");
+        if !is_hook {
+            eprintln!("Error: {e}");
+        }
         std::process::exit(1);
     }
 }

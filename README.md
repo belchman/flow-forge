@@ -97,6 +97,9 @@ flowforge plugin info <name>
 # Start the tmux team monitor
 flowforge tmux start
 
+# Test hooks with realistic Claude Code payloads
+flowforge test-hooks
+
 # Show overall status
 flowforge status
 ```
@@ -235,12 +238,18 @@ FlowForge records the complete tool-use sequence for every session:
 | `flowforge tmux start\|update\|stop\|status` | tmux team monitor |
 | `flowforge mcp serve` | Start the MCP server |
 | `flowforge statusline` | Output status line for Claude Code |
+| `flowforge test-hooks [--event NAME] [--verbose]` | Test all hooks with realistic Claude Code payloads |
 
 ## Testing
 
 ```bash
 # Run all tests
 cargo test --workspace
+
+# Test hooks with realistic Claude Code payloads
+flowforge test-hooks
+flowforge test-hooks --verbose            # Show stdin/stdout/stderr/timing
+flowforge test-hooks --event pre-tool-use # Test a single hook
 
 # Run with clippy lints
 cargo clippy --workspace -- -D warnings
@@ -249,11 +258,11 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all --check
 ```
 
-**88 tests** across 5 crates:
+**102 tests** across 5 crates:
 
 | Crate | Tests | Coverage |
 |-------|-------|----------|
-| flowforge-cli | 27 | CLI commands, hooks, sessions, mailbox, MCP (integration) |
+| flowforge-cli | 42 | CLI commands, hooks, realistic Claude Code payloads, sessions, mailbox, MCP (integration) |
 | flowforge-memory | 24 | DB operations, embedding, HNSW search, pattern learning |
 | flowforge-agents | 15 | Agent loading, registry, routing |
 | flowforge-mcp | 11 | JSON-RPC server, tool dispatch |

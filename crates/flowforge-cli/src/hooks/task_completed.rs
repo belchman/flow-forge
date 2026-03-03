@@ -3,7 +3,8 @@ use flowforge_core::{FlowForgeConfig, Result, WorkEvent};
 use flowforge_memory::MemoryDb;
 
 pub fn run() -> Result<()> {
-    let input: TaskCompletedInput = hook::parse_stdin()?;
+    let v = hook::parse_stdin_value()?;
+    let input = TaskCompletedInput::from_value(&v)?;
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
 
     // Update routing weights based on task completion
@@ -84,13 +85,8 @@ fn update_routing_weight(
 
     let db = MemoryDb::open(&db_path)?;
 
-    // Extract a simple task pattern from the subject
-    let task_pattern = task_subject
-        .to_lowercase()
-        .split_whitespace()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Extract a meaningful task pattern from the subject
+    let task_pattern = super::extract_task_pattern(task_subject);
 
     // Record a success for this agent on this task pattern
     db.record_routing_success(&task_pattern, agent_name)?;

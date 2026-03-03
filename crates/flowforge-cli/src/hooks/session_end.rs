@@ -4,7 +4,8 @@ use flowforge_core::{FlowForgeConfig, Result};
 use flowforge_memory::MemoryDb;
 
 pub fn run() -> Result<()> {
-    let _input: SessionEndInput = hook::parse_stdin()?;
+    let v = hook::parse_stdin_value()?;
+    let _input = SessionEndInput::from_value(&v)?;
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
 
     let db_path = config.db_path();
@@ -62,12 +63,31 @@ pub fn run() -> Result<()> {
             use flowforge_core::trajectory::TrajectoryStatus;
             let _ = db.end_trajectory(&trajectory.id, TrajectoryStatus::Completed);
 
-            // Judge and distill
+            // Judge and distill, then feed verdict back to routing weights
             use flowforge_memory::trajectory::TrajectoryJudge;
             let judge = TrajectoryJudge::new(&db, &config.patterns);
             if let Ok(result) = judge.judge(&trajectory.id) {
                 if result.verdict == flowforge_core::trajectory::TrajectoryVerdict::Success {
                     let _ = judge.distill(&trajectory.id);
+                }
+
+                // Feed verdict back to routing weights (close the learning loop)
+                if let (Some(ref agent_name), Some(ref task_desc)) =
+                    (&trajectory.agent_name, &trajectory.task_description)
+                {
+                    let pattern = crate::hooks::extract_task_pattern(task_desc);
+                    if !pattern.is_empty() {
+                        use flowforge_core::trajectory::TrajectoryVerdict;
+                        match result.verdict {
+                            TrajectoryVerdict::Success => {
+                                let _ = db.record_routing_success(&pattern, agent_name);
+                            }
+                            TrajectoryVerdict::Failure => {
+                                let _ = db.record_routing_failure(&pattern, agent_name);
+                            }
+                            TrajectoryVerdict::Partial => {} // avoid noise
+                        }
+                    }
                 }
             }
 

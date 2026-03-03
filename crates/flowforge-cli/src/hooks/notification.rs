@@ -1,23 +1,13 @@
 use flowforge_core::hook::{self, NotificationInput};
-use flowforge_core::{FlowForgeConfig, Result};
+use flowforge_core::Result;
 
 pub fn run() -> Result<()> {
-    let input: NotificationInput = hook::parse_stdin()?;
+    let v = hook::parse_stdin_value()?;
+    let _input = NotificationInput::from_value(&v)?;
 
-    // Log notifications to the hook error log for audit trail
-    if let Some(message) = &input.message {
-        let log_path = FlowForgeConfig::project_dir().join("hook-errors.log");
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            use std::io::Write;
-            let timestamp = chrono::Utc::now().to_rfc3339();
-            let level = input.level.as_deref().unwrap_or("info");
-            let _ = writeln!(file, "[{}] notification({}): {}", timestamp, level, message);
-        }
-    }
+    // Notifications are informational — no action needed.
+    // Previously these were logged to hook-errors.log which caused
+    // false "hook-err" warnings in the statusline.
 
     Ok(())
 }

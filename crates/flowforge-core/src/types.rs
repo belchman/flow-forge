@@ -191,6 +191,21 @@ pub enum AgentSource {
     Plugin(String),
 }
 
+/// Session context for context-aware routing
+#[derive(Debug, Clone, Default)]
+pub struct RoutingContext {
+    /// File extensions from recent edits (e.g. ["rs", "toml"])
+    pub active_file_extensions: Vec<String>,
+    /// Last N tool names from trajectory steps
+    pub recent_tools: Vec<String>,
+    /// Currently running agent type
+    pub active_agent: Option<String>,
+    /// Active work item type (e.g. "bug", "task", "feature")
+    pub active_work_type: Option<String>,
+    /// Number of edits in the current session
+    pub session_edit_count: u64,
+}
+
 /// Routing result: which agent should handle a task
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingResult {
@@ -205,6 +220,8 @@ pub struct RoutingBreakdown {
     pub capability_score: f64,
     pub learned_score: f64,
     pub priority_score: f64,
+    #[serde(default)]
+    pub context_score: f64,
 }
 
 /// Session info tracked across hooks

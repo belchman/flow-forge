@@ -171,37 +171,65 @@ fn test_statusline_empty_stdin() {
         .write_stdin("{}")
         .assert()
         .success()
-        .stdout(predicate::str::contains("FF"));
+        .stdout(predicate::str::contains("\u{2B22}"));
 }
 
 #[test]
 fn test_statusline_with_model() {
     flowforge()
         .arg("statusline")
-        .write_stdin(r#"{"model":"opus-4"}"#)
+        .write_stdin(r#"{"model":"claude-opus-4-6"}"#)
         .assert()
         .success()
-        .stdout(predicate::str::contains("FF"));
+        .stdout(predicate::str::contains("op4.6"));
+}
+
+#[test]
+fn test_statusline_legend() {
+    flowforge()
+        .arg("statusline")
+        .arg("--legend")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Statusline Legend"))
+        .stdout(predicate::str::contains("SESSION"))
+        .stdout(predicate::str::contains("TRAJECTORY"))
+        .stdout(predicate::str::contains("TRUST"))
+        .stdout(predicate::str::contains("AGENTS"))
+        .stdout(predicate::str::contains("WORK ITEMS"))
+        .stdout(predicate::str::contains("WARNINGS"));
 }
 
 // ── Session subcommands ──
 
 #[test]
 fn test_session_history_no_session() {
-    flowforge().args(["session", "history"]).assert().success();
+    // No active session → exits with error
+    flowforge()
+        .args(["session", "history"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No active session"));
 }
 
 #[test]
 fn test_session_checkpoints_no_session() {
+    // No active session → exits with error
     flowforge()
         .args(["session", "checkpoints"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("No active session"));
 }
 
 #[test]
 fn test_session_forks_no_session() {
-    flowforge().args(["session", "forks"]).assert().success();
+    // No active session → exits with error
+    flowforge()
+        .args(["session", "forks"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No active session"));
 }
 
 #[test]
@@ -236,6 +264,261 @@ fn test_mailbox_history_requires_id() {
 #[test]
 fn test_mailbox_agents_requires_id() {
     flowforge().args(["mailbox", "agents"]).assert().failure();
+}
+
+// ── Realistic Claude Code hook payloads (extra fields) ──
+
+#[test]
+fn test_hook_pre_tool_use_claude_code_payload() {
+    flowforge()
+        .args(["hook", "pre-tool-use"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "permission_mode": "bypassPermissions",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls -la"},
+                "tool_use_id": "toolu_test123"
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_hook_post_tool_use_claude_code_payload() {
+    flowforge()
+        .args(["hook", "post-tool-use"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "permission_mode": "bypassPermissions",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/tmp/test.txt"},
+                "tool_response": {"content": "hello"},
+                "tool_use_id": "toolu_test456"
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_hook_post_tool_use_failure_claude_code_payload() {
+    flowforge()
+        .args(["hook", "post-tool-use-failure"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "permission_mode": "bypassPermissions",
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_input": {"command": "false"},
+                "error": "exit code 1",
+                "tool_use_id": "toolu_test789"
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_hook_user_prompt_submit_claude_code_payload() {
+    flowforge()
+        .args(["hook", "user-prompt-submit"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "permission_mode": "bypassPermissions",
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "fix the login bug"
+            }"#,
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hookSpecificOutput"));
+}
+
+#[test]
+fn test_hook_session_start_claude_code_payload() {
+    flowforge()
+        .args(["hook", "session-start"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "hook_event_name": "SessionStart",
+                "source": "resume"
+            }"#,
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hookSpecificOutput"));
+}
+
+#[test]
+fn test_hook_session_end_claude_code_payload() {
+    flowforge()
+        .args(["hook", "session-end"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "hook_event_name": "SessionEnd",
+                "reason": "user_exit"
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_hook_stop_claude_code_payload() {
+    flowforge()
+        .args(["hook", "stop"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "hook_event_name": "Stop",
+                "stop_hook_active": true
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_hook_pre_compact_claude_code_payload() {
+    flowforge()
+        .args(["hook", "pre-compact"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "hook_event_name": "PreCompact",
+                "trigger": "auto"
+            }"#,
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hookSpecificOutput"));
+}
+
+#[test]
+fn test_hook_notification_claude_code_payload() {
+    flowforge()
+        .args(["hook", "notification"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "hook_event_name": "Notification",
+                "message": "Build completed",
+                "level": "info"
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_hook_subagent_start_claude_code_payload() {
+    flowforge()
+        .args(["hook", "subagent-start"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "hook_event_name": "SubagentStart",
+                "agent_id": "agent-001",
+                "agent_type": "general-purpose"
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_hook_subagent_stop_claude_code_payload() {
+    flowforge()
+        .args(["hook", "subagent-stop"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "hook_event_name": "SubagentStop",
+                "agent_id": "agent-001",
+                "last_assistant_message": "Done."
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_hook_teammate_idle_claude_code_payload() {
+    flowforge()
+        .args(["hook", "teammate-idle"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "hook_event_name": "TeammateIdle",
+                "teammate_name": "researcher",
+                "team_name": "my-team"
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_hook_task_completed_claude_code_payload() {
+    flowforge()
+        .args(["hook", "task-completed"])
+        .write_stdin(
+            r#"{
+                "session_id": "test-session",
+                "transcript_path": "/tmp/test-transcript.jsonl",
+                "cwd": "/tmp/flowforge-test",
+                "hook_event_name": "TaskCompleted",
+                "task_id": "task-001",
+                "task_subject": "Fix auth bug",
+                "teammate_name": "coder"
+            }"#,
+        )
+        .assert()
+        .success();
+}
+
+// ── test-hooks subcommand ──
+
+#[test]
+fn test_test_hooks_help() {
+    flowforge()
+        .args(["test-hooks", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("realistic Claude Code payloads"));
 }
 
 // ── MCP server ──

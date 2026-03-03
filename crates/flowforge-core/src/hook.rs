@@ -1,142 +1,129 @@
 //! Hook I/O types for Claude Code integration.
 //! Each hook receives JSON on stdin and may return JSON on stdout.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 // ── Common Hook Fields (B5) ──
 // All hook inputs can optionally contain these common fields.
 
 /// Common fields present in all hook inputs from Claude Code.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Extracted from raw JSON to avoid serde flatten+default bugs.
+#[derive(Debug, Clone, Default)]
 pub struct CommonHookFields {
-    #[serde(default)]
     pub session_id: Option<String>,
-    #[serde(default)]
     pub transcript_path: Option<String>,
-    #[serde(default)]
     pub cwd: Option<String>,
 }
 
-// ── Hook Input Types ──
+impl CommonHookFields {
+    /// Extract common fields from a raw JSON value.
+    pub fn from_value(v: &Value) -> Self {
+        Self {
+            session_id: v
+                .get("session_id")
+                .and_then(|x| x.as_str())
+                .map(String::from),
+            transcript_path: v
+                .get("transcript_path")
+                .and_then(|x| x.as_str())
+                .map(String::from),
+            cwd: v.get("cwd").and_then(|x| x.as_str()).map(String::from),
+        }
+    }
+}
 
-#[derive(Debug, Clone, Deserialize)]
+// ── Hook Input Types ──
+// All types use Value-based extraction to avoid serde #[flatten] + #[default]
+// bugs that cause "missing field" errors when Claude Code sends extra fields.
+
+#[derive(Debug, Clone)]
 pub struct PreToolUseInput {
     pub tool_name: String,
     pub tool_input: Value,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PostToolUseInput {
     pub tool_name: String,
     pub tool_input: Value,
-    #[serde(default)]
     pub tool_response: Option<Value>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-/// Input for PostToolUseFailure events (B2).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PostToolUseFailureInput {
     pub tool_name: String,
     pub tool_input: Value,
-    #[serde(default)]
     pub error: Option<String>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-/// Input for Notification events (B2).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct NotificationInput {
-    #[serde(default)]
     pub message: Option<String>,
-    #[serde(default)]
     pub level: Option<String>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct UserPromptSubmitInput {
-    pub prompt: String,
-    #[serde(flatten)]
+    pub prompt: Option<String>,
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SessionStartInput {
-    #[serde(default)]
     pub source: Option<String>,
-    #[serde(default)]
     pub session_id: Option<String>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SessionEndInput {
-    #[serde(default)]
     pub reason: Option<String>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StopInput {
-    #[serde(default)]
     pub stop_hook_active: bool,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PreCompactInput {
-    #[serde(default)]
     pub trigger: Option<String>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SubagentStartInput {
-    pub agent_id: String,
-    #[serde(default)]
+    pub agent_id: Option<String>,
     pub agent_type: Option<String>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SubagentStopInput {
-    pub agent_id: String,
-    #[serde(default)]
+    pub agent_id: Option<String>,
     pub last_assistant_message: Option<String>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TeammateIdleInput {
-    pub teammate_name: String,
-    #[serde(default)]
+    pub teammate_name: Option<String>,
     pub team_name: Option<String>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TaskCompletedInput {
-    #[serde(default)]
     pub task_id: Option<String>,
-    #[serde(default)]
     pub task_subject: Option<String>,
-    #[serde(default)]
     pub teammate_name: Option<String>,
-    #[serde(flatten)]
     pub common: CommonHookFields,
 }
 
@@ -291,13 +278,170 @@ pub fn read_stdin() -> crate::Result<String> {
     Ok(input)
 }
 
-/// Parse hook input from stdin as JSON
-pub fn parse_stdin<T: serde::de::DeserializeOwned>() -> crate::Result<T> {
+/// Parse hook input from stdin as raw JSON Value.
+/// All hook types now use Value-based extraction to avoid serde flatten bugs.
+pub fn parse_stdin_value() -> crate::Result<Value> {
     let input = read_stdin()?;
     if input.trim().is_empty() {
         return Err(crate::Error::Hook("Empty stdin input".to_string()));
     }
     serde_json::from_str(&input).map_err(|e| crate::Error::Hook(format!("Invalid JSON input: {e}")))
+}
+
+/// Helper: get a required string field from JSON, returning a hook error if missing.
+pub fn require_str(v: &Value, field: &str) -> crate::Result<String> {
+    v.get(field)
+        .and_then(|x| x.as_str())
+        .map(String::from)
+        .ok_or_else(|| crate::Error::Hook(format!("Missing required field: {field}")))
+}
+
+/// Helper: get an optional string field from JSON.
+pub fn opt_str(v: &Value, field: &str) -> Option<String> {
+    v.get(field).and_then(|x| x.as_str()).map(String::from)
+}
+
+// ── Typed extractors for each hook input ──
+
+impl PreToolUseInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            tool_name: require_str(v, "tool_name")?,
+            tool_input: v
+                .get("tool_input")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default())),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl PostToolUseInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            tool_name: require_str(v, "tool_name")?,
+            tool_input: v
+                .get("tool_input")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default())),
+            tool_response: v.get("tool_response").cloned(),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl PostToolUseFailureInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            tool_name: require_str(v, "tool_name")?,
+            tool_input: v
+                .get("tool_input")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default())),
+            error: opt_str(v, "error"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl NotificationInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            message: opt_str(v, "message"),
+            level: opt_str(v, "level"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl UserPromptSubmitInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            prompt: opt_str(v, "prompt"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl SessionStartInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            source: opt_str(v, "source"),
+            session_id: opt_str(v, "session_id"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl SessionEndInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            reason: opt_str(v, "reason"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl StopInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            stop_hook_active: v
+                .get("stop_hook_active")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl PreCompactInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            trigger: opt_str(v, "trigger"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl SubagentStartInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            agent_id: opt_str(v, "agent_id"),
+            agent_type: opt_str(v, "agent_type"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl SubagentStopInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            agent_id: opt_str(v, "agent_id"),
+            last_assistant_message: opt_str(v, "last_assistant_message"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl TeammateIdleInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            teammate_name: opt_str(v, "teammate_name"),
+            team_name: opt_str(v, "team_name"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
+}
+
+impl TaskCompletedInput {
+    pub fn from_value(v: &Value) -> crate::Result<Self> {
+        Ok(Self {
+            task_id: opt_str(v, "task_id"),
+            task_subject: opt_str(v, "task_subject"),
+            teammate_name: opt_str(v, "teammate_name"),
+            common: CommonHookFields::from_value(v),
+        })
+    }
 }
 
 /// Write hook output as JSON to stdout

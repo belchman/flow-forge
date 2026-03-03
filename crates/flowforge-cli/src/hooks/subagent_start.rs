@@ -3,22 +3,25 @@ use flowforge_core::{AgentSession, AgentSessionStatus, FlowForgeConfig};
 use flowforge_tmux::TmuxStateManager;
 
 pub fn run() -> flowforge_core::Result<()> {
-    let input: SubagentStartInput = hook::parse_stdin()?;
+    let v = hook::parse_stdin_value()?;
+    let input = SubagentStartInput::from_value(&v)?;
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+
+    let agent_id = input
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // Update tmux state
     let state_mgr = TmuxStateManager::new(FlowForgeConfig::tmux_state_path());
-    let _ = state_mgr.add_member(
-        &input.agent_id,
-        input.agent_type.as_deref().unwrap_or("general"),
-    );
+    let _ = state_mgr.add_member(&agent_id, input.agent_type.as_deref().unwrap_or("general"));
     let _ = state_mgr.add_event(format!(
         "{} started ({})",
-        input.agent_id,
+        agent_id,
         input.agent_type.as_deref().unwrap_or("general")
     ));
 
-    // Create agent session in DB
+    // Create agent session in DB and link trajectory to agent
     {
         let db_path = config.db_path();
         if db_path.exists() {
@@ -31,8 +34,8 @@ pub fn run() -> flowforge_core::Result<()> {
                     .unwrap_or_default();
                 let agent_session = AgentSession {
                     id: uuid::Uuid::new_v4().to_string(),
-                    parent_session_id: parent_id,
-                    agent_id: input.agent_id.clone(),
+                    parent_session_id: parent_id.clone(),
+                    agent_id: agent_id.clone(),
                     agent_type: input
                         .agent_type
                         .clone()
@@ -46,6 +49,15 @@ pub fn run() -> flowforge_core::Result<()> {
                     transcript_path: input.common.transcript_path.clone(),
                 };
                 let _ = db.create_agent_session(&agent_session);
+
+                // Link active trajectory to this agent's type
+                if let Some(ref agent_type) = input.agent_type {
+                    if let Ok(Some(trajectory)) = db.get_active_trajectory(&parent_id) {
+                        if trajectory.agent_name.is_none() {
+                            let _ = db.set_trajectory_agent_name(&trajectory.id, agent_type);
+                        }
+                    }
+                }
             }
         }
     }
@@ -57,18 +69,18 @@ pub fn run() -> flowforge_core::Result<()> {
             if let Ok(db) = flowforge_memory::MemoryDb::open(&db_path) {
                 let event = flowforge_core::WorkEvent {
                     id: 0,
-                    work_item_id: input.agent_id.clone(),
+                    work_item_id: agent_id.clone(),
                     event_type: "agent_started".to_string(),
                     old_value: None,
                     new_value: input.agent_type.clone(),
-                    actor: Some(format!("agent:{}", input.agent_id)),
+                    actor: Some(format!("agent:{}", agent_id)),
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = db.record_work_event(&event);
 
                 // Update assignee on any in-progress work items assigned to this agent
                 if let Some(ref task_id) = input.common.session_id {
-                    let agent_name = input.agent_type.as_deref().unwrap_or(&input.agent_id);
+                    let agent_name = input.agent_type.as_deref().unwrap_or(&agent_id);
                     let _ = db.update_work_item_assignee(task_id, agent_name);
                 }
             }

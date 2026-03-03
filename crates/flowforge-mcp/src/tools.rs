@@ -997,7 +997,7 @@ impl ToolRegistry {
             }
 
             let agent_refs: Vec<&_> = registry.list();
-            let results = router.route(task, &agent_refs, &learned_weights);
+            let results = router.route(task, &agent_refs, &learned_weights, None);
             Ok(results)
         }) {
             Ok(results) => {
@@ -1012,6 +1012,7 @@ impl ToolRegistry {
                                 "pattern_score": r.breakdown.pattern_score,
                                 "capability_score": r.breakdown.capability_score,
                                 "learned_score": r.breakdown.learned_score,
+                                "context_score": r.breakdown.context_score,
                                 "priority_score": r.breakdown.priority_score,
                             },
                         })

@@ -1,18 +1,27 @@
 use flowforge_agents::{AgentRegistry, AgentRouter};
 use flowforge_core::hook::{self, ContextOutput, UserPromptSubmitInput};
-use flowforge_core::{FlowForgeConfig, Result};
+use flowforge_core::{FlowForgeConfig, Result, RoutingContext};
 use flowforge_memory::MemoryDb;
 use std::collections::HashMap;
 
 pub fn run() -> Result<()> {
-    let input: UserPromptSubmitInput = hook::parse_stdin()?;
+    let _v = hook::parse_stdin_value()?;
+    // TEMPORARY: bare minimum to test if hook config is accepted
+    hook::write_stdout(&ContextOutput::none())?;
+    return Ok(());
 
-    // Skip routing for very short prompts (A10)
-    if input.prompt.trim().len() < 5 {
-        let output = ContextOutput::none();
-        hook::write_stdout(&output)?;
-        return Ok(());
-    }
+    #[allow(unreachable_code)]
+    let input = UserPromptSubmitInput::from_value(&_v)?;
+
+    let prompt = match input.prompt {
+        Some(ref p) if p.trim().len() >= 5 => p.clone(),
+        _ => {
+            // No prompt or too short — nothing to route
+            let output = ContextOutput::none();
+            hook::write_stdout(&output)?;
+            return Ok(());
+        }
+    };
 
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
     let mut context_parts: Vec<String> = Vec::new();
@@ -35,7 +44,7 @@ pub fn run() -> Result<()> {
             if let Ok(Some(trajectory)) = db.get_active_trajectory(&session.id) {
                 if trajectory.task_description.is_none() {
                     // Use first ~200 chars of prompt as task description
-                    let desc: String = input.prompt.chars().take(200).collect();
+                    let desc: String = prompt.chars().take(200).collect();
                     let _ = db.set_trajectory_task_description(&trajectory.id, &desc);
                 }
             }
@@ -49,39 +58,73 @@ pub fn run() -> Result<()> {
         HashMap::new()
     };
 
+    // Build routing context from session state
+    let routing_context = if let Some(ref db) = db {
+        build_routing_context(db)
+    } else {
+        None
+    };
+
     // Route the task to suggested agents
     if config.hooks.routing {
         if let Ok(registry) = AgentRegistry::load(&config.agents) {
             let router = AgentRouter::new(&config.routing);
             let agents: Vec<&_> = registry.list().into_iter().collect();
 
-            let results = router.route(&input.prompt, &agents, &learned_weights);
+            let results =
+                router.route(&prompt, &agents, &learned_weights, routing_context.as_ref());
 
             if let Some(top) = results.first() {
                 if top.confidence > 0.3 {
-                    let mut routing_ctx = format!(
-                        "[FlowForge] Suggested agent: {} (confidence: {:.0}%)",
-                        top.agent_name,
-                        top.confidence * 100.0
-                    );
+                    // Phase 3A: Suppress if top suggestion matches active agent
+                    let suppress = routing_context
+                        .as_ref()
+                        .and_then(|ctx| ctx.active_agent.as_ref())
+                        .map(|active| {
+                            top.agent_name.eq_ignore_ascii_case(active)
+                                && results
+                                    .get(1)
+                                    .map(|r2| (top.confidence - r2.confidence) < 0.20)
+                                    .unwrap_or(true)
+                        })
+                        .unwrap_or(false);
 
-                    // Include agent body for top match
-                    if let Some(agent) = registry.get(&top.agent_name) {
-                        if !agent.body.is_empty() {
-                            routing_ctx.push_str(&format!("\n\n{}", agent.body));
+                    if !suppress {
+                        // Phase 3B: Show breakdown in suggestion
+                        let b = &top.breakdown;
+                        let breakdown_line = format!(
+                            "Why: pattern={:.0}%, cap={:.0}%, learned={:.0}%, context={:.0}%",
+                            b.pattern_score * 100.0,
+                            b.capability_score * 100.0,
+                            b.learned_score * 100.0,
+                            b.context_score * 100.0,
+                        );
+
+                        let mut routing_ctx = format!(
+                            "[FlowForge] Suggested agent: {} (confidence: {:.0}%)\n{}",
+                            top.agent_name,
+                            top.confidence * 100.0,
+                            breakdown_line,
+                        );
+
+                        // Include agent body for top match
+                        if let Some(agent) = registry.get(&top.agent_name) {
+                            if !agent.body.is_empty() {
+                                routing_ctx.push_str(&format!("\n\n{}", agent.body));
+                            }
                         }
-                    }
 
-                    // Show runner-up if close
-                    if results.len() > 1 && results[1].confidence > 0.25 {
-                        routing_ctx.push_str(&format!(
-                            "\nAlternative: {} ({:.0}%)",
-                            results[1].agent_name,
-                            results[1].confidence * 100.0
-                        ));
-                    }
+                        // Show runner-up if close
+                        if results.len() > 1 && results[1].confidence > 0.25 {
+                            routing_ctx.push_str(&format!(
+                                "\nAlternative: {} ({:.0}%)",
+                                results[1].agent_name,
+                                results[1].confidence * 100.0
+                            ));
+                        }
 
-                    context_parts.push(routing_ctx);
+                        context_parts.push(routing_ctx);
+                    }
                 }
             }
         }
@@ -139,7 +182,7 @@ pub fn run() -> Result<()> {
     if config.hooks.learning {
         if let Some(ref db) = db {
             // Search learned patterns
-            if let Ok(patterns) = db.search_patterns_short(&input.prompt, 3) {
+            if let Ok(patterns) = db.search_patterns_short(&prompt, 3) {
                 let relevant: Vec<_> = patterns
                     .into_iter()
                     .filter(|p| p.confidence > 0.5)
@@ -158,7 +201,7 @@ pub fn run() -> Result<()> {
             }
 
             // Also search long-term patterns for high-confidence knowledge
-            if let Ok(long_patterns) = db.search_patterns_long(&input.prompt, 3) {
+            if let Ok(long_patterns) = db.search_patterns_long(&prompt, 3) {
                 let relevant: Vec<_> = long_patterns
                     .into_iter()
                     .filter(|p| p.confidence > 0.6)
@@ -179,7 +222,7 @@ pub fn run() -> Result<()> {
             }
 
             // Search key-value memory for relevant stored knowledge
-            if let Ok(kv_results) = db.kv_search(&input.prompt, 3) {
+            if let Ok(kv_results) = db.kv_search(&prompt, 3) {
                 if !kv_results.is_empty() {
                     let mut kv_ctx = String::from("[FlowForge Memory] Stored knowledge:");
                     for (key, value, _ns) in &kv_results {
@@ -200,6 +243,61 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build routing context from current session state.
+fn build_routing_context(db: &MemoryDb) -> Option<RoutingContext> {
+    let session = db.get_current_session().ok().flatten()?;
+
+    let mut ctx = RoutingContext {
+        session_edit_count: session.edits,
+        ..Default::default()
+    };
+
+    // Get file extensions from recent edits
+    if let Ok(edits) = db.get_edits_for_session(&session.id) {
+        let mut seen = std::collections::HashSet::new();
+        for edit in edits.iter().rev().take(20) {
+            if let Some(ref ext) = edit.file_extension {
+                if seen.insert(ext.clone()) {
+                    ctx.active_file_extensions.push(ext.clone());
+                }
+            }
+        }
+    }
+
+    // Get recent tool names from active trajectory
+    if let Ok(Some(trajectory)) = db.get_active_trajectory(&session.id) {
+        if let Ok(steps) = db.get_trajectory_steps(&trajectory.id) {
+            ctx.recent_tools = steps
+                .iter()
+                .rev()
+                .take(10)
+                .map(|s| s.tool_name.clone())
+                .collect();
+        }
+    }
+
+    // Get active agent type
+    if let Ok(agent_sessions) = db.get_active_agent_sessions() {
+        if let Some(first) = agent_sessions.first() {
+            ctx.active_agent = Some(first.agent_type.clone());
+        }
+    }
+
+    // Get active work item type
+    let filter = flowforge_core::WorkFilter {
+        status: Some("in_progress".to_string()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    if let Ok(items) = db.list_work_items(&filter) {
+        if let Some(item) = items.first() {
+            ctx.active_work_type = Some(item.item_type.clone());
+        }
+    }
+
+    Some(ctx)
 }
 
 fn load_learned_weights_from_db(db: &MemoryDb) -> HashMap<(String, String), f64> {

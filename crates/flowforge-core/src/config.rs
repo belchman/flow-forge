@@ -99,6 +99,8 @@ pub struct RoutingConfig {
     pub learned_weight: f64,
     #[serde(default = "default_priority_weight")]
     pub priority_weight: f64,
+    #[serde(default = "default_context_weight")]
+    pub context_weight: f64,
 }
 
 impl Default for RoutingConfig {
@@ -108,6 +110,7 @@ impl Default for RoutingConfig {
             capability_weight: default_capability_weight(),
             learned_weight: default_learned_weight(),
             priority_weight: default_priority_weight(),
+            context_weight: default_context_weight(),
         }
     }
 }
@@ -375,16 +378,19 @@ fn default_embedding_dim() -> usize {
     128
 }
 fn default_pattern_weight() -> f64 {
-    0.40
+    0.35
 }
 fn default_capability_weight() -> f64 {
-    0.30
+    0.25
 }
 fn default_learned_weight() -> f64 {
-    0.25
+    0.20
 }
 fn default_priority_weight() -> f64 {
     0.05
+}
+fn default_context_weight() -> f64 {
+    0.15
 }
 fn default_short_term_max() -> usize {
     500

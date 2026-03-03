@@ -38,6 +38,9 @@ cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" 2>&1
 
 echo ""
 echo "==> Installing flowforge to ~/.cargo/bin..."
+# Remove old binary first — macOS caches in-place overwrites, causing the
+# new binary to hang.  rm + copy forces the OS to pick up the fresh build.
+rm -f "$HOME/.cargo/bin/flowforge" 2>/dev/null || true
 cargo install --path "$SCRIPT_DIR/crates/flowforge-cli" --force 2>&1
 
 # Ensure ~/.cargo/bin is on PATH for the current shell

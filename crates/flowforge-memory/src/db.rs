@@ -2284,6 +2284,16 @@ impl MemoryDb {
         Ok(())
     }
 
+    pub fn set_trajectory_agent_name(&self, id: &str, agent_name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE trajectories SET agent_name = ?1 WHERE id = ?2",
+                params![agent_name, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn link_trajectory_work_item(&self, trajectory_id: &str, work_item_id: &str) -> Result<()> {
         self.conn
             .execute(

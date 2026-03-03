@@ -4,19 +4,22 @@ use flowforge_memory::MemoryDb;
 use flowforge_tmux::TmuxStateManager;
 
 pub fn run() -> Result<()> {
-    let input: TeammateIdleInput = hook::parse_stdin()?;
+    let v = hook::parse_stdin_value()?;
+    let input = TeammateIdleInput::from_value(&v)?;
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+
+    let teammate_name = input.teammate_name.as_deref().unwrap_or("unknown");
 
     // Update tmux state
     let state_mgr = TmuxStateManager::new(FlowForgeConfig::tmux_state_path());
-    let _ = state_mgr.update_member_status(&input.teammate_name, TeamMemberStatus::Idle, None);
-    let _ = state_mgr.add_event(format!("{} went idle", input.teammate_name));
+    let _ = state_mgr.update_member_status(teammate_name, TeamMemberStatus::Idle, None);
+    let _ = state_mgr.add_event(format!("{} went idle", teammate_name));
 
     // Persist idle status to DB
     let db_path = config.db_path();
     if db_path.exists() {
         if let Ok(db) = MemoryDb::open(&db_path) {
-            let _ = db.update_agent_session_status(&input.teammate_name, AgentSessionStatus::Idle);
+            let _ = db.update_agent_session_status(teammate_name, AgentSessionStatus::Idle);
 
             // Detect and handle stale work items
             if config.work_tracking.work_stealing.enabled {
