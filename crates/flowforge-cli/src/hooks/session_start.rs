@@ -37,6 +37,7 @@ pub fn run() -> Result<()> {
         edits: 0,
         commands: 0,
         summary: None,
+        transcript_path: input.common.transcript_path.clone(),
     };
 
     db.create_session(&session)?;

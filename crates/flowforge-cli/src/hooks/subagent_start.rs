@@ -43,6 +43,7 @@ pub fn run() -> flowforge_core::Result<()> {
                     edits: 0,
                     commands: 0,
                     task_id: None,
+                    transcript_path: input.common.transcript_path.clone(),
                 };
                 let _ = db.create_agent_session(&agent_session);
             }

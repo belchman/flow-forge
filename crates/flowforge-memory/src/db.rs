@@ -4,8 +4,9 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use flowforge_core::{
-    work_tracking::WorkDb, AgentSession, AgentSessionStatus, EditRecord, Error, LongTermPattern,
-    Result, RoutingWeight, SessionInfo, ShortTermPattern, WorkEvent, WorkFilter, WorkItem,
+    work_tracking::WorkDb, AgentSession, AgentSessionStatus, Checkpoint, ConversationMessage,
+    EditRecord, Error, LongTermPattern, MailboxMessage, Result, RoutingWeight, SessionFork,
+    SessionInfo, ShortTermPattern, WorkEvent, WorkFilter, WorkItem,
 };
 
 /// (db_id, source_type, source_id, vector)
@@ -162,10 +163,92 @@ impl MemoryDb {
             );
             CREATE INDEX IF NOT EXISTS idx_agent_sessions_parent ON agent_sessions(parent_session_id);
             CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent ON agent_sessions(agent_id);
+
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                message_index INTEGER NOT NULL,
+                message_type TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                model TEXT,
+                message_id TEXT,
+                parent_uuid TEXT,
+                timestamp TEXT NOT NULL,
+                metadata TEXT,
+                source TEXT DEFAULT 'transcript',
+                UNIQUE(session_id, message_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conv_session ON conversation_messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_conv_type ON conversation_messages(message_type);
+            CREATE INDEX IF NOT EXISTS idx_conv_timestamp ON conversation_messages(timestamp);
+
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                message_index INTEGER NOT NULL,
+                description TEXT,
+                git_ref TEXT,
+                created_at TEXT NOT NULL,
+                metadata TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoint_name ON checkpoints(session_id, name);
+
+            CREATE TABLE IF NOT EXISTS session_forks (
+                id TEXT PRIMARY KEY,
+                source_session_id TEXT NOT NULL,
+                target_session_id TEXT NOT NULL,
+                fork_message_index INTEGER NOT NULL,
+                checkpoint_id TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_forks_source ON session_forks(source_session_id);
+            CREATE INDEX IF NOT EXISTS idx_forks_target ON session_forks(target_session_id);
+
+            CREATE TABLE IF NOT EXISTS agent_mailbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_item_id TEXT NOT NULL,
+                from_session_id TEXT NOT NULL,
+                from_agent_name TEXT NOT NULL,
+                to_session_id TEXT,
+                to_agent_name TEXT,
+                message_type TEXT DEFAULT 'text',
+                content TEXT NOT NULL,
+                priority INTEGER DEFAULT 2,
+                read_at TEXT,
+                created_at TEXT NOT NULL,
+                metadata TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_mailbox_work ON agent_mailbox(work_item_id);
+            CREATE INDEX IF NOT EXISTS idx_mailbox_to ON agent_mailbox(to_session_id);
+            CREATE INDEX IF NOT EXISTS idx_mailbox_unread ON agent_mailbox(to_session_id, read_at);
+            CREATE INDEX IF NOT EXISTS idx_mailbox_from ON agent_mailbox(from_session_id);
         ",
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
+
+        // Migrations: add columns to existing tables if missing
+        self.migrate_add_column("sessions", "transcript_path", "TEXT")?;
+        self.migrate_add_column("agent_sessions", "transcript_path", "TEXT")?;
+
         Ok(())
+    }
+
+    fn migrate_add_column(&self, table: &str, column: &str, col_type: &str) -> Result<()> {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
+        match self.conn.execute_batch(&sql) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("duplicate column name") || msg.contains("already exists") {
+                    Ok(()) // column already present
+                } else {
+                    Err(Error::Sqlite(msg))
+                }
+            }
+        }
     }
 
     // ── Key-Value ──
@@ -252,8 +335,8 @@ impl MemoryDb {
     pub fn create_session(&self, session: &SessionInfo) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO sessions (id, started_at, ended_at, cwd, edits, commands, summary)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR REPLACE INTO sessions (id, started_at, ended_at, cwd, edits, commands, summary, transcript_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     session.id,
                     session.started_at.to_rfc3339(),
@@ -262,6 +345,7 @@ impl MemoryDb {
                     session.edits,
                     session.commands,
                     session.summary,
+                    session.transcript_path,
                 ],
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
@@ -281,7 +365,7 @@ impl MemoryDb {
     pub fn get_current_session(&self) -> Result<Option<SessionInfo>> {
         self.conn
             .query_row(
-                "SELECT id, started_at, ended_at, cwd, edits, commands, summary
+                "SELECT id, started_at, ended_at, cwd, edits, commands, summary, transcript_path
                  FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1",
                 [],
                 |row| {
@@ -293,6 +377,7 @@ impl MemoryDb {
                         edits: row.get(4)?,
                         commands: row.get(5)?,
                         summary: row.get(6)?,
+                        transcript_path: row.get(7).ok().flatten(),
                     })
                 },
             )
@@ -304,7 +389,7 @@ impl MemoryDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, started_at, ended_at, cwd, edits, commands, summary
+                "SELECT id, started_at, ended_at, cwd, edits, commands, summary, transcript_path
                  FROM sessions ORDER BY started_at DESC LIMIT ?1",
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
@@ -318,6 +403,7 @@ impl MemoryDb {
                     edits: row.get(4)?,
                     commands: row.get(5)?,
                     summary: row.get(6)?,
+                    transcript_path: row.get(7).ok().flatten(),
                 })
             })
             .map_err(|e| Error::Sqlite(e.to_string()))?;
@@ -351,8 +437,8 @@ impl MemoryDb {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO agent_sessions
-                 (id, parent_session_id, agent_id, agent_type, status, started_at, ended_at, edits, commands, task_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, parent_session_id, agent_id, agent_type, status, started_at, ended_at, edits, commands, task_id, transcript_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     session.id,
                     session.parent_session_id,
@@ -364,6 +450,7 @@ impl MemoryDb {
                     session.edits,
                     session.commands,
                     session.task_id,
+                    session.transcript_path,
                 ],
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
@@ -402,7 +489,7 @@ impl MemoryDb {
             .conn
             .prepare(
                 "SELECT id, parent_session_id, agent_id, agent_type, status,
-                        started_at, ended_at, edits, commands, task_id
+                        started_at, ended_at, edits, commands, task_id, transcript_path
                  FROM agent_sessions WHERE parent_session_id = ?1
                  ORDER BY started_at DESC",
             )
@@ -421,7 +508,7 @@ impl MemoryDb {
             .conn
             .prepare(
                 "SELECT id, parent_session_id, agent_id, agent_type, status,
-                        started_at, ended_at, edits, commands, task_id
+                        started_at, ended_at, edits, commands, task_id, transcript_path
                  FROM agent_sessions WHERE ended_at IS NULL
                  ORDER BY started_at DESC",
             )
@@ -1281,6 +1368,466 @@ impl MemoryDb {
             .map_err(|e| Error::Sqlite(e.to_string()))?;
         Ok(())
     }
+
+    // ── Session Transcript Path ──
+
+    pub fn update_session_transcript_path(&self, session_id: &str, path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET transcript_path = ?1 WHERE id = ?2",
+                params![path, session_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn update_agent_session_transcript_path(&self, agent_id: &str, path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE agent_sessions SET transcript_path = ?1
+                 WHERE agent_id = ?2 AND ended_at IS NULL",
+                params![path, agent_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    // ── Conversation Messages ──
+
+    pub fn store_conversation_message(&self, msg: &ConversationMessage) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO conversation_messages
+                 (session_id, message_index, message_type, role, content, model,
+                  message_id, parent_uuid, timestamp, metadata, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    msg.session_id,
+                    msg.message_index,
+                    msg.message_type,
+                    msg.role,
+                    msg.content,
+                    msg.model,
+                    msg.message_id,
+                    msg.parent_uuid,
+                    msg.timestamp.to_rfc3339(),
+                    msg.metadata,
+                    msg.source,
+                ],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn ingest_transcript(&self, session_id: &str, transcript_path: &str) -> Result<u32> {
+        let latest = self.get_latest_message_index(session_id)?;
+        let messages = flowforge_core::transcript::parse_transcript(transcript_path, session_id)?;
+
+        let mut count = 0u32;
+        for msg in &messages {
+            if msg.message_index >= latest {
+                self.store_conversation_message(msg)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn get_conversation_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ConversationMessage>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, message_index, message_type, role, content,
+                        model, message_id, parent_uuid, timestamp, metadata, source
+                 FROM conversation_messages WHERE session_id = ?1
+                 ORDER BY message_index ASC LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id, limit, offset], |row| {
+                Ok(parse_conversation_message_row(row))
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn get_conversation_message_count(&self, session_id: &str) -> Result<u32> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn get_conversation_messages_range(
+        &self,
+        session_id: &str,
+        from: u32,
+        to: u32,
+    ) -> Result<Vec<ConversationMessage>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, message_index, message_type, role, content,
+                        model, message_id, parent_uuid, timestamp, metadata, source
+                 FROM conversation_messages
+                 WHERE session_id = ?1 AND message_index >= ?2 AND message_index <= ?3
+                 ORDER BY message_index ASC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id, from, to], |row| {
+                Ok(parse_conversation_message_row(row))
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn get_latest_message_index(&self, session_id: &str) -> Result<u32> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(MAX(message_index) + 1, 0) FROM conversation_messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn search_conversation_messages(
+        &self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationMessage>> {
+        let pattern = format!("%{query}%");
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, message_index, message_type, role, content,
+                        model, message_id, parent_uuid, timestamp, metadata, source
+                 FROM conversation_messages
+                 WHERE session_id = ?1 AND content LIKE ?2
+                 ORDER BY message_index ASC LIMIT ?3",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id, pattern, limit], |row| {
+                Ok(parse_conversation_message_row(row))
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    // ── Checkpoints ──
+
+    pub fn create_checkpoint(&self, cp: &Checkpoint) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO checkpoints (id, session_id, name, message_index, description, git_ref, created_at, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    cp.id,
+                    cp.session_id,
+                    cp.name,
+                    cp.message_index,
+                    cp.description,
+                    cp.git_ref,
+                    cp.created_at.to_rfc3339(),
+                    cp.metadata,
+                ],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_checkpoint(&self, id: &str) -> Result<Option<Checkpoint>> {
+        self.conn
+            .query_row(
+                "SELECT id, session_id, name, message_index, description, git_ref, created_at, metadata
+                 FROM checkpoints WHERE id = ?1",
+                params![id],
+                |row| Ok(parse_checkpoint_row(row)),
+            )
+            .optional()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn get_checkpoint_by_name(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<Option<Checkpoint>> {
+        self.conn
+            .query_row(
+                "SELECT id, session_id, name, message_index, description, git_ref, created_at, metadata
+                 FROM checkpoints WHERE session_id = ?1 AND name = ?2",
+                params![session_id, name],
+                |row| Ok(parse_checkpoint_row(row)),
+            )
+            .optional()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<Checkpoint>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, name, message_index, description, git_ref, created_at, metadata
+                 FROM checkpoints WHERE session_id = ?1 ORDER BY message_index ASC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| Ok(parse_checkpoint_row(row)))
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn delete_checkpoint(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM checkpoints WHERE id = ?1", params![id])
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    // ── Session Forks ──
+
+    pub fn fork_conversation(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        up_to_index: u32,
+    ) -> Result<u32> {
+        let count: u32 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_messages
+                 WHERE session_id = ?1 AND message_index <= ?2",
+                params![source_id, up_to_index],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO conversation_messages
+                 (session_id, message_index, message_type, role, content, model,
+                  message_id, parent_uuid, timestamp, metadata, source)
+                 SELECT ?1, message_index, message_type, role, content, model,
+                        message_id, parent_uuid, timestamp, metadata, 'forked'
+                 FROM conversation_messages
+                 WHERE session_id = ?2 AND message_index <= ?3",
+                params![target_id, source_id, up_to_index],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+
+        Ok(count)
+    }
+
+    pub fn create_session_fork(&self, fork: &SessionFork) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO session_forks
+                 (id, source_session_id, target_session_id, fork_message_index,
+                  checkpoint_id, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    fork.id,
+                    fork.source_session_id,
+                    fork.target_session_id,
+                    fork.fork_message_index,
+                    fork.checkpoint_id,
+                    fork.reason,
+                    fork.created_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_session_forks(&self, session_id: &str) -> Result<Vec<SessionFork>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, source_session_id, target_session_id, fork_message_index,
+                        checkpoint_id, reason, created_at
+                 FROM session_forks
+                 WHERE source_session_id = ?1 OR target_session_id = ?1
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| Ok(parse_session_fork_row(row)))
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn get_session_lineage(&self, session_id: &str) -> Result<Vec<SessionFork>> {
+        // Trace fork chain to root: follow source_session_id backwards
+        let mut lineage = Vec::new();
+        let mut current = session_id.to_string();
+        for _ in 0..50 {
+            // safety limit
+            let fork: Option<SessionFork> = self
+                .conn
+                .query_row(
+                    "SELECT id, source_session_id, target_session_id, fork_message_index,
+                            checkpoint_id, reason, created_at
+                     FROM session_forks WHERE target_session_id = ?1",
+                    params![current],
+                    |row| Ok(parse_session_fork_row(row)),
+                )
+                .optional()
+                .map_err(|e| Error::Sqlite(e.to_string()))?;
+            match fork {
+                Some(f) => {
+                    current = f.source_session_id.clone();
+                    lineage.push(f);
+                }
+                None => break,
+            }
+        }
+        lineage.reverse();
+        Ok(lineage)
+    }
+
+    // ── Agent Mailbox ──
+
+    pub fn send_mailbox_message(&self, msg: &MailboxMessage) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO agent_mailbox
+                 (work_item_id, from_session_id, from_agent_name, to_session_id, to_agent_name,
+                  message_type, content, priority, created_at, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    msg.work_item_id,
+                    msg.from_session_id,
+                    msg.from_agent_name,
+                    msg.to_session_id,
+                    msg.to_agent_name,
+                    msg.message_type,
+                    msg.content,
+                    msg.priority,
+                    msg.created_at.to_rfc3339(),
+                    msg.metadata,
+                ],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_unread_messages(&self, session_id: &str) -> Result<Vec<MailboxMessage>> {
+        // Get messages targeted at this session OR broadcasts (to_session_id IS NULL)
+        // for work items this agent is on
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, work_item_id, from_session_id, from_agent_name, to_session_id,
+                        to_agent_name, message_type, content, priority, read_at, created_at, metadata
+                 FROM agent_mailbox
+                 WHERE read_at IS NULL
+                   AND (to_session_id = ?1 OR (to_session_id IS NULL AND from_session_id != ?1))
+                 ORDER BY priority ASC, created_at ASC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok(parse_mailbox_message_row(row))
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn mark_messages_read(&self, session_id: &str) -> Result<u32> {
+        let now = Utc::now().to_rfc3339();
+        let count = self
+            .conn
+            .execute(
+                "UPDATE agent_mailbox SET read_at = ?1
+                 WHERE read_at IS NULL
+                   AND (to_session_id = ?2 OR (to_session_id IS NULL AND from_session_id != ?2))",
+                params![now, session_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    pub fn mark_message_read(&self, id: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE agent_mailbox SET read_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_mailbox_history(
+        &self,
+        work_item_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MailboxMessage>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, work_item_id, from_session_id, from_agent_name, to_session_id,
+                        to_agent_name, message_type, content, priority, read_at, created_at, metadata
+                 FROM agent_mailbox WHERE work_item_id = ?1
+                 ORDER BY created_at DESC LIMIT ?2",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![work_item_id, limit], |row| {
+                Ok(parse_mailbox_message_row(row))
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn get_agents_on_work_item(&self, work_item_id: &str) -> Result<Vec<AgentSession>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, parent_session_id, agent_id, agent_type, status,
+                        started_at, ended_at, edits, commands, task_id, transcript_path
+                 FROM agent_sessions WHERE task_id = ?1
+                 ORDER BY started_at DESC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![work_item_id], |row| {
+                Ok(parse_agent_session_row(row))
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn update_agent_session_work_item(&self, agent_id: &str, work_item_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE agent_sessions SET task_id = ?1
+                 WHERE agent_id = ?2 AND ended_at IS NULL",
+                params![work_item_id, agent_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl WorkDb for MemoryDb {
@@ -1319,6 +1866,69 @@ impl WorkDb for MemoryDb {
     }
     fn get_recent_work_events(&self, limit: usize) -> Result<Vec<WorkEvent>> {
         self.get_recent_work_events(limit)
+    }
+}
+
+fn parse_conversation_message_row(row: &rusqlite::Row) -> ConversationMessage {
+    ConversationMessage {
+        id: row.get(0).unwrap_or(0),
+        session_id: row.get(1).unwrap_or_default(),
+        message_index: row.get(2).unwrap_or(0),
+        message_type: row.get(3).unwrap_or_default(),
+        role: row.get(4).unwrap_or_default(),
+        content: row.get(5).unwrap_or_default(),
+        model: row.get(6).ok().flatten(),
+        message_id: row.get(7).ok().flatten(),
+        parent_uuid: row.get(8).ok().flatten(),
+        timestamp: parse_datetime(row.get::<_, String>(9).unwrap_or_default()),
+        metadata: row.get(10).ok().flatten(),
+        source: row.get(11).unwrap_or_else(|_| "transcript".to_string()),
+    }
+}
+
+fn parse_checkpoint_row(row: &rusqlite::Row) -> Checkpoint {
+    Checkpoint {
+        id: row.get(0).unwrap_or_default(),
+        session_id: row.get(1).unwrap_or_default(),
+        name: row.get(2).unwrap_or_default(),
+        message_index: row.get(3).unwrap_or(0),
+        description: row.get(4).ok().flatten(),
+        git_ref: row.get(5).ok().flatten(),
+        created_at: parse_datetime(row.get::<_, String>(6).unwrap_or_default()),
+        metadata: row.get(7).ok().flatten(),
+    }
+}
+
+fn parse_session_fork_row(row: &rusqlite::Row) -> SessionFork {
+    SessionFork {
+        id: row.get(0).unwrap_or_default(),
+        source_session_id: row.get(1).unwrap_or_default(),
+        target_session_id: row.get(2).unwrap_or_default(),
+        fork_message_index: row.get(3).unwrap_or(0),
+        checkpoint_id: row.get(4).ok().flatten(),
+        reason: row.get(5).ok().flatten(),
+        created_at: parse_datetime(row.get::<_, String>(6).unwrap_or_default()),
+    }
+}
+
+fn parse_mailbox_message_row(row: &rusqlite::Row) -> MailboxMessage {
+    MailboxMessage {
+        id: row.get(0).unwrap_or(0),
+        work_item_id: row.get(1).unwrap_or_default(),
+        from_session_id: row.get(2).unwrap_or_default(),
+        from_agent_name: row.get(3).unwrap_or_default(),
+        to_session_id: row.get(4).ok().flatten(),
+        to_agent_name: row.get(5).ok().flatten(),
+        message_type: row.get(6).unwrap_or_else(|_| "text".to_string()),
+        content: row.get(7).unwrap_or_default(),
+        priority: row.get(8).unwrap_or(2),
+        read_at: row
+            .get::<_, Option<String>>(9)
+            .ok()
+            .flatten()
+            .map(parse_datetime),
+        created_at: parse_datetime(row.get::<_, String>(10).unwrap_or_default()),
+        metadata: row.get(11).ok().flatten(),
     }
 }
 
@@ -1370,6 +1980,7 @@ fn parse_agent_session_row(row: &rusqlite::Row) -> AgentSession {
         edits: row.get(7).unwrap_or(0),
         commands: row.get(8).unwrap_or(0),
         task_id: row.get(9).ok().flatten(),
+        transcript_path: row.get(10).ok().flatten(),
     }
 }
 
@@ -1588,6 +2199,7 @@ mod tests {
             edits: 0,
             commands: 0,
             summary: None,
+            transcript_path: None,
         };
 
         db.create_session(&session).unwrap();

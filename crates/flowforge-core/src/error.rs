@@ -37,6 +37,9 @@ pub enum Error {
     #[error("MCP error: {0}")]
     Mcp(String),
 
+    #[error("Conversation error: {0}")]
+    Conversation(String),
+
     #[error("Not found: {0}")]
     NotFound(String),
 

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod hook;
+pub mod transcript;
 pub mod types;
 pub mod work_tracking;
 

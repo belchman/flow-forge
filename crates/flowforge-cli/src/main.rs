@@ -75,6 +75,11 @@ enum Commands {
         #[command(subcommand)]
         action: WorkAction,
     },
+    /// Co-agent mailbox operations
+    Mailbox {
+        #[command(subcommand)]
+        action: MailboxAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -141,6 +146,52 @@ enum SessionAction {
     Metrics,
     /// List agent sessions for current or specified session
     Agents {
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Show conversation history for a session
+    History {
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Manually ingest a transcript file
+    Ingest {
+        /// Path to JSONL transcript file
+        path: String,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Create a checkpoint at the current conversation position
+    Checkpoint {
+        /// Checkpoint name
+        name: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List checkpoints for a session
+    Checkpoints {
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Fork a session's conversation at a checkpoint or index
+    Fork {
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        checkpoint: Option<String>,
+        #[arg(long)]
+        at_index: Option<u32>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Show fork tree for a session
+    Forks {
         #[arg(long)]
         session_id: Option<String>,
     },
@@ -249,6 +300,41 @@ enum WorkAction {
     },
 }
 
+#[derive(Subcommand)]
+enum MailboxAction {
+    /// Send a message to co-agents
+    Send {
+        /// Work item ID (coordination hub)
+        #[arg(long)]
+        work_item: String,
+        /// Sender agent name
+        #[arg(long)]
+        from: String,
+        /// Optional target agent name (omit for broadcast)
+        #[arg(long)]
+        to: Option<String>,
+        /// Message content
+        message: String,
+    },
+    /// Read unread messages for the current session
+    Read {
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Show mailbox history for a work item
+    History {
+        /// Work item ID
+        work_item_id: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// List agents on a work item
+    Agents {
+        /// Work item ID
+        work_item_id: String,
+    },
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -304,6 +390,36 @@ fn main() {
             SessionAction::Agents { session_id } => {
                 commands::session::agents(session_id.as_deref())
             }
+            SessionAction::History {
+                session_id,
+                limit,
+                offset,
+            } => commands::session::history(session_id.as_deref(), limit, offset),
+            SessionAction::Ingest { path, session_id } => {
+                commands::session::ingest(&path, session_id.as_deref())
+            }
+            SessionAction::Checkpoint {
+                name,
+                session_id,
+                description,
+            } => {
+                commands::session::checkpoint(&name, session_id.as_deref(), description.as_deref())
+            }
+            SessionAction::Checkpoints { session_id } => {
+                commands::session::checkpoints(session_id.as_deref())
+            }
+            SessionAction::Fork {
+                session_id,
+                checkpoint,
+                at_index,
+                reason,
+            } => commands::session::fork(
+                session_id.as_deref(),
+                checkpoint.as_deref(),
+                at_index,
+                reason.as_deref(),
+            ),
+            SessionAction::Forks { session_id } => commands::session::forks(session_id.as_deref()),
         },
         Commands::Learn { action } => match action {
             LearnAction::Store { content, category } => commands::learn::store(&content, &category),
@@ -347,6 +463,20 @@ fn main() {
             WorkAction::Sync => commands::work::sync(),
             WorkAction::Status => commands::work::status(),
             WorkAction::Log { limit, since } => commands::work::log(limit, since.as_deref()),
+        },
+        Commands::Mailbox { action } => match action {
+            MailboxAction::Send {
+                work_item,
+                from,
+                to,
+                message,
+            } => commands::mailbox::send(&work_item, &from, to.as_deref(), &message),
+            MailboxAction::Read { session_id } => commands::mailbox::read(session_id.as_deref()),
+            MailboxAction::History {
+                work_item_id,
+                limit,
+            } => commands::mailbox::history(&work_item_id, limit),
+            MailboxAction::Agents { work_item_id } => commands::mailbox::agents(&work_item_id),
         },
     };
 

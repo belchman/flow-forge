@@ -12,11 +12,15 @@ pub fn run() -> Result<()> {
     let _ = state_mgr.update_member_status(&input.agent_id, TeamMemberStatus::Completed, None);
     let _ = state_mgr.add_event(format!("{} stopped", input.agent_id));
 
-    // End agent session in DB
+    // Ingest agent transcript and end agent session in DB
     {
         let db_path = config.db_path();
         if db_path.exists() {
             if let Ok(db) = MemoryDb::open(&db_path) {
+                // Ingest transcript if available
+                if let Some(ref path) = input.common.transcript_path {
+                    let _ = db.ingest_transcript(&input.agent_id, path);
+                }
                 let _ = db.end_agent_session(&input.agent_id, AgentSessionStatus::Completed);
             }
         }

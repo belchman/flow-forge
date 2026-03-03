@@ -184,6 +184,60 @@ fn test_statusline_with_model() {
         .stdout(predicate::str::contains("FF"));
 }
 
+// ── Session subcommands ──
+
+#[test]
+fn test_session_history_no_session() {
+    flowforge().args(["session", "history"]).assert().success();
+}
+
+#[test]
+fn test_session_checkpoints_no_session() {
+    flowforge()
+        .args(["session", "checkpoints"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_session_forks_no_session() {
+    flowforge().args(["session", "forks"]).assert().success();
+}
+
+#[test]
+fn test_session_ingest_missing_file() {
+    flowforge()
+        .args(["session", "ingest", "/nonexistent/transcript.jsonl"])
+        .assert()
+        .failure();
+}
+
+// ── Mailbox commands ──
+
+#[test]
+fn test_mailbox_read_no_session() {
+    flowforge().args(["mailbox", "read"]).assert().success();
+}
+
+#[test]
+fn test_mailbox_send_requires_args() {
+    flowforge()
+        .args(["mailbox", "send"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--work-item"));
+}
+
+#[test]
+fn test_mailbox_history_requires_id() {
+    flowforge().args(["mailbox", "history"]).assert().failure();
+}
+
+#[test]
+fn test_mailbox_agents_requires_id() {
+    flowforge().args(["mailbox", "agents"]).assert().failure();
+}
+
 // ── MCP server ──
 
 #[test]

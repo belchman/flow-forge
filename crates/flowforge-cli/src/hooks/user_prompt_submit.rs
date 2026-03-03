@@ -100,6 +100,28 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Inject unread co-agent mailbox messages
+    if let Some(ref db) = db {
+        if let Some(ref sid) = input.common.session_id {
+            if let Ok(unread) = db.get_unread_messages(sid) {
+                if !unread.is_empty() {
+                    let mut ctx = format!(
+                        "[FlowForge Mailbox] {} unread from co-agents:",
+                        unread.len()
+                    );
+                    for msg in &unread {
+                        ctx.push_str(&format!(
+                            "\n  From {}: {}",
+                            msg.from_agent_name, msg.content
+                        ));
+                    }
+                    context_parts.push(ctx);
+                    let _ = db.mark_messages_read(sid);
+                }
+            }
+        }
+    }
+
     // Search FlowForge memory for relevant patterns and stored knowledge
     if config.hooks.learning {
         if let Some(ref db) = db {

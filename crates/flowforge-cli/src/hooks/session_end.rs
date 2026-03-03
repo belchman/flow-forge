@@ -17,6 +17,18 @@ pub fn run() -> Result<()> {
     // Capture session data BEFORE ending it (get_current_session filters by ended_at IS NULL)
     let current_session = db.get_current_session().ok().flatten();
 
+    // Ingest transcript before ending session
+    if let Some(ref session) = current_session {
+        // Try transcript_path from session record, or from hook input
+        let transcript = session
+            .transcript_path
+            .as_deref()
+            .or(_input.common.transcript_path.as_deref());
+        if let Some(path) = transcript {
+            let _ = db.ingest_transcript(&session.id, path);
+        }
+    }
+
     // End current session
     if let Some(ref session) = current_session {
         db.end_session(&session.id, Utc::now())?;
