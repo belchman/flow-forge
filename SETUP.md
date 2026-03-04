@@ -171,6 +171,9 @@ custom_rules = []
 [work_tracking]
 # Backend auto-detection: kanbus, beads, claude_tasks
 
+[work_tracking.kanbus]
+# root = "/path/to/kanbus/repo"  # Optional override; defaults to cwd
+
 [work_tracking.work_stealing]
 enabled = true
 stale_threshold_mins = 30
@@ -205,6 +208,7 @@ disabled = []   # takes precedence over enabled
 ### Work tracking backend
 - FlowForge auto-detects: `.kanbus.yml` -> Kanbus, `.beads/` -> Beads, else -> Claude Tasks
 - Override in `.flowforge/config.toml`: `[work_tracking] backend = "kanbus"`
+- Kanbus uses the native crate API (no CLI shelling); set `[work_tracking.kanbus] root = "..."` to override the project root
 
 ### Plugin not loading
 - Check plugin directory exists: `.flowforge/plugins/<name>/plugin.toml`

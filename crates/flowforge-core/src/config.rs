@@ -272,10 +272,28 @@ impl Default for WorkStealingConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KanbusSyncConfig {
     #[serde(default)]
     pub project_key: Option<String>,
+    #[serde(default = "default_kbs_command")]
+    pub cli_command: String,
+    #[serde(default)]
+    pub root: Option<std::path::PathBuf>,
+}
+
+impl Default for KanbusSyncConfig {
+    fn default() -> Self {
+        Self {
+            project_key: None,
+            cli_command: default_kbs_command(),
+            root: None,
+        }
+    }
+}
+
+fn default_kbs_command() -> String {
+    "kbs".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -432,10 +450,10 @@ fn default_dedup_threshold() -> f64 {
     0.88
 }
 fn default_clustering_min_points() -> usize {
-    3
+    2
 }
 fn default_clustering_epsilon() -> f64 {
-    0.3
+    0.5
 }
 fn default_outlier_recluster_threshold() -> usize {
     50

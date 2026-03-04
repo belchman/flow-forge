@@ -14,6 +14,7 @@ dirs = { workspace = true }
 tracing = { workspace = true }
 regex = { workspace = true }
 sha2 = { workspace = true }
+kanbus = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

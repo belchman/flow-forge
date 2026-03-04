@@ -12,7 +12,7 @@ Agent orchestration for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 - **Trajectory learning** &mdash; records complete tool-use sequences per session, judges outcomes, distills successful paths into reusable strategies
 - **Semantic memory** &mdash; SQLite + HNSW vector search with real semantic embeddings (AllMiniLM-L6-v2 via fastembed), DBSCAN topic clustering, per-cluster P95 dedup thresholds, and cluster-aware decay
 - **Guidance control plane** &mdash; configurable safety gates on all tool uses with trust scoring, SHA-256 audit chain, and automatic rule enforcement
-- **Work tracking** &mdash; tracks tasks, epics, and bugs with a full audit trail; work-stealing redistributes stale/abandoned tasks automatically
+- **Work tracking** &mdash; tracks tasks, epics, and bugs with a full audit trail; native Kanbus crate integration (no CLI shelling), Beads JSONL reads, and Claude Tasks dual-write; work-stealing redistributes stale/abandoned tasks automatically
 - **Conversation storage** &mdash; ingests Claude Code JSONL transcripts into SQLite for querying past sessions
 - **Checkpoints &amp; forks** &mdash; named snapshots at any point in a conversation; fork a session to branch reasoning
 - **Co-agent mailbox** &mdash; peer agents on the same work item exchange messages, auto-injected into context

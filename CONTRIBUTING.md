@@ -175,7 +175,7 @@ The init command in `crates/flowforge-cli/src/commands/init.rs` sets up new proj
 | `crates/flowforge-core/src/guidance.rs` | Guidance engine (5 gates) |
 | `crates/flowforge-core/src/plugin.rs` | Plugin manifest loader |
 | `crates/flowforge-core/src/plugin_exec.rs` | Plugin command execution |
-| `crates/flowforge-core/src/work_tracking.rs` | WorkDb trait, work-stealing functions |
+| `crates/flowforge-core/src/work_tracking.rs` | WorkBackend trait, KanbusBackend (native crate), BeadsBackend, WorkDb trait, work-stealing |
 | `crates/flowforge-core/src/trajectory.rs` | Trajectory types |
 | `crates/flowforge-memory/src/db.rs` | SQLite schema, all DB methods (~80 methods) |
 | `crates/flowforge-memory/src/trajectory.rs` | Trajectory judge (judgment, distillation, consolidation) |

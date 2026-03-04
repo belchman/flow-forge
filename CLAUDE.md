@@ -31,7 +31,10 @@ FlowForge uses BOTH a fast Rust-based memory system AND Claude's native auto-mem
 - Claude memory: design decisions, workflow preferences, project philosophy
 - Use BOTH for critical knowledge — redundancy improves recall
 
-### Work Tracking & Work-Stealing
+### Work Tracking (MANDATORY)
+- **EVERY non-trivial task MUST be tracked.** Use `TaskCreate` for session-scoped steps (visible during the session). For larger features or cross-session work, also create a FlowForge work item with `flowforge work create "<description>" --type task`.
+- Before starting any feature, fix, or refactor: create tasks so the user can see what's in progress, what's pending, and what's done.
+- Update task status as you go (`TaskUpdate` for session tasks, `flowforge work update` for persistent items). Close/complete when done.
 - FlowForge tracks all work items (epics, tasks, bugs) automatically via hooks
 - Every task completion, agent assignment, and status change is logged
 - **Work-stealing**: agents auto-detect stale/abandoned tasks and redistribute them
@@ -40,7 +43,7 @@ FlowForge uses BOTH a fast Rust-based memory system AND Claude's native auto-mem
 - Use `flowforge work claim <id>` / `flowforge work release <id>` for claim lifecycle
 - Use `flowforge work stealable` / `flowforge work steal` for redistribution
 - Use `flowforge work load` to see work distribution across agents
-- Supported backends: Claude Tasks, Beads, Kanbus (auto-detected)
+- Supported backends: Claude Tasks, Beads, Kanbus (auto-detected); Kanbus uses native crate API (no CLI shelling)
 - MCP tools: `work_create`, `work_list`, `work_update`, `work_log`, `work_close`, `work_sync`, `work_load`, `work_claim`, `work_release`, `work_steal`, `work_heartbeat`
 
 ### Guidance Control Plane
