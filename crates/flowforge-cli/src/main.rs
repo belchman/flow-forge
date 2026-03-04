@@ -258,6 +258,10 @@ enum LearnAction {
         /// Trajectory ID
         id: String,
     },
+    /// Download semantic embedding model
+    DownloadModel,
+    /// Show topic clusters
+    Clusters,
 }
 
 #[derive(Subcommand)]
@@ -560,6 +564,8 @@ fn main() {
             } => commands::learn::trajectories(session.as_deref(), status.as_deref(), limit),
             LearnAction::Trajectory { id } => commands::learn::trajectory(&id),
             LearnAction::Judge { id } => commands::learn::judge(&id),
+            LearnAction::DownloadModel => commands::learn::download_model(),
+            LearnAction::Clusters => commands::learn::clusters(),
         },
         Commands::Agent { action } => match action {
             AgentAction::List => commands::agent::list(),

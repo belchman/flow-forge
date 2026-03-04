@@ -305,12 +305,13 @@ fn load_learned_weights_from_db(db: &MemoryDb, prompt: &str) -> HashMap<(String,
 
     // 2. Pre-compute similarity-based matches for generalization (Fix 5)
     // Embed the incoming prompt, search routing vectors, and inject similar weights
-    let embedding = flowforge_memory::embedding::Embedding::default();
+    let config_for_embed = flowforge_core::config::PatternsConfig::default();
+    let embedding = flowforge_memory::default_embedder(&config_for_embed);
     let query_vec = embedding.embed(prompt);
 
     if let Ok(routing_vecs) = db.get_vectors_for_source("routing") {
         for (_, source_id, vec) in &routing_vecs {
-            let sim = flowforge_memory::embedding::Embedding::cosine_similarity(&query_vec, vec);
+            let sim = flowforge_memory::cosine_similarity(&query_vec, vec);
             if sim > 0.7 {
                 // source_id is "task_pattern::agent_name"
                 if let Some((task_pattern, agent_name)) = source_id.split_once("::") {

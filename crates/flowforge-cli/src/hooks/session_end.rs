@@ -88,7 +88,8 @@ pub fn run() -> Result<()> {
                             TrajectoryVerdict::Partial => {} // avoid noise
                         }
                         // Store routing embedding for similarity-based generalization
-                        let embedding = flowforge_memory::embedding::Embedding::default();
+                        let config_for_embed = flowforge_core::config::PatternsConfig::default();
+                        let embedding = flowforge_memory::default_embedder(&config_for_embed);
                         let vec = embedding.embed(&pattern);
                         let source_id = format!("{}::{}", pattern, agent_name);
                         let _ = db.store_vector("routing", &source_id, &vec);

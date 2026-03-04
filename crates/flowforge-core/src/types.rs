@@ -296,6 +296,18 @@ pub struct PatternMatch {
     pub similarity: f32,
 }
 
+/// Topic cluster for pattern vectors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternCluster {
+    pub id: i64,
+    pub centroid: Vec<f32>,
+    pub member_count: i64,
+    pub p95_distance: f64,
+    pub avg_confidence: f64,
+    pub created_at: DateTime<Utc>,
+    pub last_recomputed: DateTime<Utc>,
+}
+
 /// Routing weight for learning
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingWeight {

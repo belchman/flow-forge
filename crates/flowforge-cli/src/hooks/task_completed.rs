@@ -92,7 +92,8 @@ fn update_routing_weight(
     db.record_routing_success(&task_pattern, agent_name)?;
 
     // Store routing embedding for similarity-based generalization
-    let embedding = flowforge_memory::embedding::Embedding::default();
+    let config_for_embed = flowforge_core::config::PatternsConfig::default();
+    let embedding = flowforge_memory::default_embedder(&config_for_embed);
     let vec = embedding.embed(&task_pattern);
     let source_id = format!("{}::{}", task_pattern, agent_name);
     let _ = db.store_vector("routing", &source_id, &vec);

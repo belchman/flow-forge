@@ -1,6 +1,6 @@
 use instant_distance::{Builder, HnswMap, Search};
 
-use crate::embedding::Embedding;
+use crate::embedding::cosine_similarity;
 
 /// Wrapper around instant-distance HNSW index for vector search.
 pub struct HnswIndex {
@@ -13,7 +13,7 @@ struct Point(Vec<f32>);
 impl instant_distance::Point for Point {
     fn distance(&self, other: &Self) -> f32 {
         // Cosine distance = 1.0 - cosine_similarity
-        1.0 - Embedding::cosine_similarity(&self.0, &other.0)
+        1.0 - cosine_similarity(&self.0, &other.0)
     }
 }
 
@@ -70,6 +70,8 @@ impl Default for HnswIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::Embedder;
+    use crate::embedding::HashEmbedder;
 
     #[test]
     fn test_empty_index() {
@@ -81,7 +83,7 @@ mod tests {
 
     #[test]
     fn test_build_and_search() {
-        let emb = Embedding::new(128);
+        let emb = HashEmbedder::new(128);
         let mut index = HnswIndex::new();
 
         let points = vec![
@@ -104,7 +106,7 @@ mod tests {
 
     #[test]
     fn test_build_single_point() {
-        let emb = Embedding::new(128);
+        let emb = HashEmbedder::new(128);
         let mut index = HnswIndex::new();
 
         index.build(&[(42, emb.embed("hello"))]);

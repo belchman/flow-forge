@@ -290,6 +290,16 @@ impl MemoryDb {
             CREATE INDEX IF NOT EXISTS idx_trajectory_steps_traj ON trajectory_steps(trajectory_id);
             CREATE INDEX IF NOT EXISTS idx_trajectories_session ON trajectories(session_id);
             CREATE INDEX IF NOT EXISTS idx_trajectories_status ON trajectories(status);
+
+            CREATE TABLE IF NOT EXISTS pattern_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                centroid BLOB NOT NULL,
+                member_count INTEGER NOT NULL DEFAULT 0,
+                p95_distance REAL NOT NULL DEFAULT 0.0,
+                avg_confidence REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL,
+                last_recomputed TEXT NOT NULL
+            );
         ",
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
@@ -310,6 +320,16 @@ impl MemoryDb {
             "CREATE INDEX IF NOT EXISTS idx_work_items_claimed ON work_items(claimed_by);
              CREATE INDEX IF NOT EXISTS idx_work_items_stealable ON work_items(stealable);
              CREATE INDEX IF NOT EXISTS idx_work_items_heartbeat ON work_items(last_heartbeat);",
+        );
+
+        // Clustering migrations
+        self.migrate_add_column(
+            "hnsw_entries",
+            "cluster_id",
+            "INTEGER REFERENCES pattern_clusters(id)",
+        )?;
+        let _ = self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_hnsw_entries_cluster ON hnsw_entries(cluster_id);",
         );
 
         Ok(())
@@ -2545,6 +2565,162 @@ impl MemoryDb {
             .map_err(|e| Error::Sqlite(e.to_string()))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    // ── Clustering ──
+
+    /// Store a new cluster, returning its ID.
+    pub fn store_cluster(&self, cluster: &flowforge_core::PatternCluster) -> Result<i64> {
+        let centroid_bytes = vector_to_blob(&cluster.centroid);
+        let now = cluster.created_at.to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO pattern_clusters (centroid, member_count, p95_distance, avg_confidence, created_at, last_recomputed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![centroid_bytes, cluster.member_count, cluster.p95_distance, cluster.avg_confidence, now],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get a cluster by ID.
+    pub fn get_cluster(&self, id: i64) -> Result<Option<flowforge_core::PatternCluster>> {
+        self.conn
+            .query_row(
+                "SELECT id, centroid, member_count, p95_distance, avg_confidence, created_at, last_recomputed
+                 FROM pattern_clusters WHERE id = ?1",
+                params![id],
+                |row| {
+                    let centroid_bytes: Vec<u8> = row.get(1)?;
+                    Ok(flowforge_core::PatternCluster {
+                        id: row.get(0)?,
+                        centroid: blob_to_vector(&centroid_bytes),
+                        member_count: row.get(2)?,
+                        p95_distance: row.get(3)?,
+                        avg_confidence: row.get(4)?,
+                        created_at: parse_datetime(row.get::<_, String>(5)?),
+                        last_recomputed: parse_datetime(row.get::<_, String>(6)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    /// Get all clusters.
+    pub fn get_all_clusters(&self) -> Result<Vec<flowforge_core::PatternCluster>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, centroid, member_count, p95_distance, avg_confidence, created_at, last_recomputed
+                 FROM pattern_clusters ORDER BY member_count DESC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let centroid_bytes: Vec<u8> = row.get(1)?;
+                Ok(flowforge_core::PatternCluster {
+                    id: row.get(0)?,
+                    centroid: blob_to_vector(&centroid_bytes),
+                    member_count: row.get(2)?,
+                    p95_distance: row.get(3)?,
+                    avg_confidence: row.get(4)?,
+                    created_at: parse_datetime(row.get::<_, String>(5)?),
+                    last_recomputed: parse_datetime(row.get::<_, String>(6)?),
+                })
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    /// Delete all clusters (used before reclustering).
+    pub fn delete_all_clusters(&self) -> Result<()> {
+        self.conn
+            .execute("UPDATE hnsw_entries SET cluster_id = NULL", [])
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        self.conn
+            .execute("DELETE FROM pattern_clusters", [])
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Set the cluster_id for a vector entry.
+    pub fn set_vector_cluster_id(&self, vector_id: i64, cluster_id: Option<i64>) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE hnsw_entries SET cluster_id = ?1 WHERE id = ?2",
+                params![cluster_id, vector_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get cluster_id for a vector entry.
+    pub fn get_vector_cluster_id(&self, vector_id: i64) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT cluster_id FROM hnsw_entries WHERE id = ?1",
+                params![vector_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+            .map(|o| o.flatten())
+    }
+
+    /// Count vectors with no cluster assignment (outliers).
+    /// Count total vectors in the HNSW index.
+    pub fn count_vectors(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM hnsw_entries", [], |row| row.get(0))
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    pub fn count_outlier_vectors(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM hnsw_entries WHERE cluster_id IS NULL AND source_type IN ('pattern_short', 'pattern_long')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    /// Get all pattern vectors with their IDs (for clustering).
+    pub fn get_all_pattern_vectors(&self) -> Result<Vec<(i64, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, vector FROM hnsw_entries WHERE source_type IN ('pattern_short', 'pattern_long')",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let bytes: Vec<u8> = row.get(1)?;
+                Ok((row.get(0)?, blob_to_vector(&bytes)))
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    /// Update cluster stats (member_count, p95, avg_confidence).
+    pub fn update_cluster_stats(
+        &self,
+        cluster_id: i64,
+        member_count: i64,
+        p95_distance: f64,
+        avg_confidence: f64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE pattern_clusters SET member_count = ?1, p95_distance = ?2, avg_confidence = ?3, last_recomputed = ?4 WHERE id = ?5",
+                params![member_count, p95_distance, avg_confidence, now, cluster_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
     }
 }
 

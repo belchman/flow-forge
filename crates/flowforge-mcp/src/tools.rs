@@ -54,6 +54,7 @@ impl ToolRegistry {
             "learning_search" => self.learning_search(params),
             "learning_feedback" => self.learning_feedback(params),
             "learning_stats" => self.learning_stats(params),
+            "learning_clusters" => self.learning_clusters(params),
             "agents_list" => self.agents_list(params),
             "agents_route" => self.agents_route(params),
             "agents_info" => self.agents_info(params),
@@ -234,6 +235,15 @@ impl ToolRegistry {
         self.register(ToolDef {
             name: "learning_stats".into(),
             description: "Get statistics about learned patterns".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "learning_clusters".into(),
+            description: "Get topic cluster information for pattern vectors".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -989,6 +999,35 @@ impl ToolRegistry {
                     "short_term_count": short,
                     "long_term_count": long,
                     "total": short + long,
+                })
+            }
+            Err(e) => {
+                json!({"status": "error", "message": format!("Failed to open database: {e}")})
+            }
+        }
+    }
+
+    fn learning_clusters(&self, _params: &Value) -> Value {
+        match Self::open_db() {
+            Ok(db) => {
+                let clusters = db.get_all_clusters().unwrap_or_default();
+                let outlier_count = db.count_outlier_vectors().unwrap_or(0);
+                let cluster_info: Vec<Value> = clusters
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "member_count": c.member_count,
+                            "p95_distance": c.p95_distance,
+                            "avg_confidence": c.avg_confidence,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "status": "ok",
+                    "cluster_count": clusters.len(),
+                    "outlier_count": outlier_count,
+                    "clusters": cluster_info,
                 })
             }
             Err(e) => {
@@ -2452,9 +2491,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_registry_has_52_tools() {
+    fn test_registry_has_53_tools() {
         let registry = ToolRegistry::new();
-        assert_eq!(registry.list().len(), 52);
+        assert_eq!(registry.list().len(), 53);
     }
 
     #[test]

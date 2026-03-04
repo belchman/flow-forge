@@ -8,7 +8,7 @@ use flowforge_core::config::PatternsConfig;
 use flowforge_core::{LongTermPattern, PatternMatch, PatternTier, Result, ShortTermPattern};
 
 use crate::db::MemoryDb;
-use crate::embedding::Embedding;
+use crate::embedding::{cosine_similarity, default_embedder, Embedder};
 use crate::hnsw::HnswIndex;
 
 /// Cached HNSW index with the vector count it was built from.
@@ -22,7 +22,7 @@ struct CachedIndex {
 pub struct PatternStore<'a> {
     db: &'a MemoryDb,
     config: &'a PatternsConfig,
-    embedding: Embedding,
+    embedding: Box<dyn Embedder>,
     /// Lazily-built HNSW index cached for the lifetime of this PatternStore.
     hnsw_cache: RefCell<Option<CachedIndex>>,
 }
@@ -32,7 +32,7 @@ impl<'a> PatternStore<'a> {
         Self {
             db,
             config,
-            embedding: Embedding::default(),
+            embedding: default_embedder(config),
             hnsw_cache: RefCell::new(None),
         }
     }
@@ -131,20 +131,54 @@ impl<'a> PatternStore<'a> {
         // 5. Re-embed all vectors if embedding version changed
         self.migrate_embeddings()?;
 
+        // 6. Re-cluster if needed
+        self.maybe_recluster()?;
+
         Ok(())
     }
 
     /// Search all patterns (both tiers) using HNSW when >50 total, else brute-force.
+    /// Boosts results from the same cluster as the query.
     pub fn search_all_patterns(&self, query: &str, k: usize) -> Result<Vec<PatternMatch>> {
         let query_vec = self.embedding.embed(query);
         let total =
             self.db.count_patterns_short()? as usize + self.db.count_patterns_long()? as usize;
 
-        if total > 50 {
-            self.search_with_hnsw(&query_vec, k)
+        let mut results = if total > 50 {
+            self.search_with_hnsw(&query_vec, k)?
         } else {
-            self.search_brute_force(&query_vec, k)
+            self.search_brute_force(&query_vec, k)?
+        };
+
+        // Boost results from the same cluster as the query
+        let cluster_mgr = crate::clustering::ClusterManager::new(self.db, self.config);
+        if let Ok(Some(query_cluster)) = cluster_mgr.find_cluster(&query_vec) {
+            // Look up embedding IDs for each result to check cluster membership
+            let all_short = self.db.get_vectors_for_source("pattern_short")?;
+            let all_long = self.db.get_vectors_for_source("pattern_long")?;
+            let mut source_to_eid: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            for (db_id, source_id, _) in all_short.iter().chain(all_long.iter()) {
+                source_to_eid.insert(source_id.clone(), *db_id);
+            }
+
+            for result in &mut results {
+                if let Some(&eid) = source_to_eid.get(&result.id) {
+                    if let Ok(Some(cid)) = self.db.get_vector_cluster_id(eid) {
+                        if cid == query_cluster.cluster_id {
+                            result.similarity *= 1.1; // 10% boost for same-cluster
+                        }
+                    }
+                }
+            }
+            results.sort_by(|a, b| {
+                b.similarity
+                    .partial_cmp(&a.similarity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
+
+        Ok(results)
     }
 
     /// Fetch a pattern by ID and tier, returning a PatternMatch if found.
@@ -266,11 +300,11 @@ impl<'a> PatternStore<'a> {
         let mut scored: Vec<(String, PatternTier, f32)> = Vec::new();
 
         for (_, source_id, vec) in &short_vecs {
-            let sim = Embedding::cosine_similarity(query_vec, vec);
+            let sim = cosine_similarity(query_vec, vec);
             scored.push((source_id.clone(), PatternTier::Short, sim));
         }
         for (_, source_id, vec) in &long_vecs {
-            let sim = Embedding::cosine_similarity(query_vec, vec);
+            let sim = cosine_similarity(query_vec, vec);
             scored.push((source_id.clone(), PatternTier::Long, sim));
         }
 
@@ -316,20 +350,37 @@ impl<'a> PatternStore<'a> {
         Ok(()) // Pattern not found, silently ignore
     }
 
+    /// Get cluster-aware decay multiplier for a pattern.
+    /// Patterns in large clusters decay slower; outliers decay faster.
+    fn decay_multiplier(&self, embedding_id: Option<i64>) -> f64 {
+        if let Some(eid) = embedding_id {
+            if let Ok(Some(cluster_id)) = self.db.get_vector_cluster_id(eid) {
+                if let Ok(Some(cluster)) = self.db.get_cluster(cluster_id) {
+                    if cluster.member_count > 10 {
+                        return self.config.cluster_decay_active_factor; // Active cluster, slow decay
+                    }
+                }
+                return 1.0; // Small cluster, normal decay
+            }
+        }
+        self.config.cluster_decay_isolated_factor // Outlier, fast decay
+    }
+
     /// Apply confidence decay based on time since last use. (A6)
+    /// Uses cluster-aware decay multipliers.
     fn apply_decay(&self) -> Result<()> {
         let now = Utc::now();
 
-        // Short-term patterns: decay at configured rate
+        // Short-term patterns: decay at configured rate * cluster multiplier
         let short_patterns = self.db.get_all_patterns_short()?;
         for p in &short_patterns {
             let hours = (now - p.last_used).num_hours().max(0) as f64;
             if hours < 1.0 {
                 continue;
             }
-            let decayed = p.confidence - (self.config.decay_rate_per_hour * hours);
+            let multiplier = self.decay_multiplier(p.embedding_id);
+            let decayed = p.confidence - (self.config.decay_rate_per_hour * hours * multiplier);
             if decayed < 0.1 {
-                // Too low confidence — remove
                 self.db.delete_pattern_short(&p.id)?;
                 self.db.delete_vectors_for_source("pattern_short", &p.id)?;
             } else if (decayed - p.confidence).abs() > 0.001 {
@@ -337,15 +388,16 @@ impl<'a> PatternStore<'a> {
             }
         }
 
-        // Long-term patterns: slower decay (0.1%/hr), never delete but mark dormant
+        // Long-term patterns: slower decay (0.1%/hr) * cluster multiplier
         let long_patterns = self.db.get_all_patterns_long()?;
         for p in &long_patterns {
             let hours = (now - p.last_used).num_hours().max(0) as f64;
             if hours < 1.0 {
                 continue;
             }
+            let multiplier = self.decay_multiplier(p.embedding_id);
             let decay_rate = 0.001; // 0.1% per hour for long-term
-            let decayed = (p.confidence - (decay_rate * hours)).max(0.05); // Floor at 0.05 (dormant)
+            let decayed = (p.confidence - (decay_rate * hours * multiplier)).max(0.05);
             if (decayed - p.confidence).abs() > 0.001 {
                 self.db.update_pattern_long_confidence(&p.id, decayed)?;
             }
@@ -369,42 +421,65 @@ impl<'a> PatternStore<'a> {
         Ok(())
     }
 
+    /// Get the dedup threshold, using per-cluster p95 when both vectors are in the same cluster.
+    fn get_dedup_threshold(&self, embedding_id_a: Option<i64>, embedding_id_b: Option<i64>) -> f32 {
+        if let (Some(eid_a), Some(eid_b)) = (embedding_id_a, embedding_id_b) {
+            if let (Ok(cluster_a), Ok(cluster_b)) = (
+                self.db.get_vector_cluster_id(eid_a),
+                self.db.get_vector_cluster_id(eid_b),
+            ) {
+                if let (Some(ca), Some(cb)) = (cluster_a, cluster_b) {
+                    if ca == cb {
+                        // Same cluster — use cluster's p95 as threshold (convert distance to similarity)
+                        if let Ok(Some(cluster)) = self.db.get_cluster(ca) {
+                            return 1.0 - cluster.p95_distance as f32;
+                        }
+                    }
+                }
+            }
+        }
+        self.config.dedup_similarity_threshold as f32
+    }
+
     /// Deduplicate using stored vectors instead of re-embedding. (A11)
+    /// Uses per-cluster p95 thresholds when available.
     fn deduplicate(&self) -> Result<()> {
         let patterns = self.db.get_all_patterns_short()?;
         if patterns.len() < 2 {
             return Ok(());
         }
 
-        // Load stored vectors indexed by source_id
+        // Load stored vectors indexed by source_id, also track embedding IDs
         let vectors = self.db.get_vectors_for_source("pattern_short")?;
-        let vec_map: HashMap<String, Vec<f32>> = vectors
+        let vec_map: HashMap<String, (Vec<f32>, i64)> = vectors
             .into_iter()
-            .map(|(_, source_id, vec)| (source_id, vec))
+            .map(|(db_id, source_id, vec)| (source_id, (vec, db_id)))
             .collect();
 
         let mut to_remove: HashSet<usize> = HashSet::new();
-        let threshold = self.config.dedup_similarity_threshold as f32;
+        let fallback_threshold = self.config.dedup_similarity_threshold as f32;
 
         for i in 0..patterns.len() {
             if to_remove.contains(&i) {
                 continue;
             }
-            let vec_i = match vec_map.get(&patterns[i].id) {
-                Some(v) => v,
+            let (vec_i, eid_i) = match vec_map.get(&patterns[i].id) {
+                Some(v) => (&v.0, Some(v.1)),
                 None => continue,
             };
             for j in (i + 1)..patterns.len() {
                 if to_remove.contains(&j) {
                     continue;
                 }
-                let vec_j = match vec_map.get(&patterns[j].id) {
-                    Some(v) => v,
+                let (vec_j, eid_j) = match vec_map.get(&patterns[j].id) {
+                    Some(v) => (&v.0, Some(v.1)),
                     None => continue,
                 };
-                let sim = Embedding::cosine_similarity(vec_i, vec_j);
+                let sim = cosine_similarity(vec_i, vec_j);
+                let threshold = self.get_dedup_threshold(eid_i, eid_j);
+                // Use at least the fallback threshold to prevent over-aggressive dedup
+                let threshold = threshold.max(fallback_threshold);
                 if sim > threshold {
-                    // Keep the one with higher confidence/usage
                     if patterns[j].confidence < patterns[i].confidence
                         || (patterns[j].confidence == patterns[i].confidence
                             && patterns[j].usage_count < patterns[i].usage_count)
@@ -486,6 +561,26 @@ impl<'a> PatternStore<'a> {
 
         // Clean up orphaned vectors
         self.db.cleanup_orphaned_long_vectors()?;
+        Ok(())
+    }
+
+    /// Re-cluster if never run or if outlier count exceeds threshold.
+    fn maybe_recluster(&self) -> Result<()> {
+        let last_run = self.db.get_meta("last_cluster_run")?;
+        let outlier_count = self
+            .db
+            .get_meta("outlier_count_since_cluster")?
+            .unwrap_or_else(|| "0".to_string())
+            .parse::<usize>()
+            .unwrap_or(0);
+
+        let should_recluster =
+            last_run.is_none() || outlier_count >= self.config.outlier_recluster_threshold;
+
+        if should_recluster {
+            let mgr = crate::clustering::ClusterManager::new(self.db, self.config);
+            mgr.recluster()?;
+        }
         Ok(())
     }
 

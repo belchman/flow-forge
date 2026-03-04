@@ -112,6 +112,25 @@ pub fn stats() -> Result<()> {
         }
     }
 
+    let cluster_count = db.get_all_clusters()?.len();
+    let outlier_count = db.count_outlier_vectors()?;
+    if cluster_count > 0 || outlier_count > 0 {
+        println!();
+        println!("{}", "Clusters:".bold());
+        println!("  Topic clusters: {}", cluster_count);
+        println!("  Outlier vectors: {}", outlier_count);
+    }
+
+    println!();
+    println!(
+        "Embedder: {}",
+        if config.patterns.semantic_embeddings {
+            "semantic (AllMiniLM-L6-v2Q, 384-dim)"
+        } else {
+            "hash (xxhash n-gram, 128-dim)"
+        }
+    );
+
     Ok(())
 }
 
@@ -191,6 +210,47 @@ pub fn trajectory(id: &str) -> Result<()> {
     let ratio = db.trajectory_success_ratio(&t.id)?;
     println!();
     println!("  Success ratio: {:.1}%", ratio * 100.0);
+
+    Ok(())
+}
+
+pub fn download_model() -> Result<()> {
+    #[cfg(feature = "semantic")]
+    {
+        println!("Downloading semantic embedding model (AllMiniLM-L6-v2 quantized)...");
+        let _embedder = flowforge_memory::SemanticEmbedder::new_with_progress();
+        println!("{} Model downloaded and ready", "✓".green());
+    }
+    #[cfg(not(feature = "semantic"))]
+    {
+        println!("Semantic embeddings not enabled (compile with --features semantic)");
+    }
+    Ok(())
+}
+
+pub fn clusters() -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = MemoryDb::open(&config.db_path())?;
+
+    let clusters = db.get_all_clusters()?;
+    if clusters.is_empty() {
+        println!("No clusters found. Run consolidation to generate clusters.");
+        return Ok(());
+    }
+
+    let outlier_count = db.count_outlier_vectors()?;
+
+    println!("{} ({} clusters)", "Topic Clusters".bold(), clusters.len());
+    for c in &clusters {
+        println!(
+            "  Cluster #{}: {} members, p95={:.2}, avg_conf={:.0}%",
+            c.id,
+            c.member_count,
+            c.p95_distance,
+            c.avg_confidence * 100.0
+        );
+    }
+    println!("  Outliers: {} unclustered patterns", outlier_count);
 
     Ok(())
 }

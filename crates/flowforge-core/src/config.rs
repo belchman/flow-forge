@@ -137,6 +137,18 @@ pub struct PatternsConfig {
     pub trajectory_prune_days: u64,
     #[serde(default = "default_trajectory_merge_threshold")]
     pub trajectory_merge_threshold: f64,
+    #[serde(default = "default_true")]
+    pub semantic_embeddings: bool,
+    #[serde(default = "default_clustering_min_points")]
+    pub clustering_min_points: usize,
+    #[serde(default = "default_clustering_epsilon")]
+    pub clustering_epsilon: f64,
+    #[serde(default = "default_outlier_recluster_threshold")]
+    pub outlier_recluster_threshold: usize,
+    #[serde(default = "default_cluster_decay_active_factor")]
+    pub cluster_decay_active_factor: f64,
+    #[serde(default = "default_cluster_decay_isolated_factor")]
+    pub cluster_decay_isolated_factor: f64,
 }
 
 impl Default for PatternsConfig {
@@ -152,6 +164,12 @@ impl Default for PatternsConfig {
             trajectory_max: default_trajectory_max(),
             trajectory_prune_days: default_trajectory_prune_days(),
             trajectory_merge_threshold: default_trajectory_merge_threshold(),
+            semantic_embeddings: true,
+            clustering_min_points: default_clustering_min_points(),
+            clustering_epsilon: default_clustering_epsilon(),
+            outlier_recluster_threshold: default_outlier_recluster_threshold(),
+            cluster_decay_active_factor: default_cluster_decay_active_factor(),
+            cluster_decay_isolated_factor: default_cluster_decay_isolated_factor(),
         }
     }
 }
@@ -412,6 +430,21 @@ fn default_decay_rate() -> f64 {
 }
 fn default_dedup_threshold() -> f64 {
     0.88
+}
+fn default_clustering_min_points() -> usize {
+    3
+}
+fn default_clustering_epsilon() -> f64 {
+    0.3
+}
+fn default_outlier_recluster_threshold() -> usize {
+    50
+}
+fn default_cluster_decay_active_factor() -> f64 {
+    0.5
+}
+fn default_cluster_decay_isolated_factor() -> f64 {
+    2.0
 }
 fn default_tmux_session() -> String {
     "flowforge".to_string()

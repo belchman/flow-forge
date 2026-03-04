@@ -29,15 +29,29 @@ pub fn run() -> Result<()> {
         }
     };
 
+    // Claude Code delivers model as an object: { "id": "...", "display_name": "..." }
     let model = stdin_data
         .get("model")
-        .and_then(|v| v.as_str())
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()))
         .unwrap_or("");
 
     let project_name = std::env::current_dir()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "unknown".to_string());
+
+    // Extract context window remaining percentage (pre-calculated by Claude Code)
+    let ctx_remaining: Option<u32> = stdin_data
+        .get("context_window")
+        .and_then(|cw| cw.get("remaining_percentage"))
+        .and_then(|v| v.as_f64())
+        .map(|f| f as u32);
+
+    // Extract optional session name
+    let session_name: Option<&str> = stdin_data
+        .get("session_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
 
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path()).ok();
     let db = config
@@ -47,10 +61,23 @@ pub fn run() -> Result<()> {
     let mut sections = Vec::new();
 
     // ── Section 1: Identity ──
-    let mut identity = format!("{} {}", SYM_FORGE.cyan(), project_name.bold().cyan());
+    let display_name = session_name.unwrap_or(&project_name);
+    let mut identity = format!("{} {}", SYM_FORGE.cyan(), display_name.bold().cyan());
     if !model.is_empty() {
         let short_model = shorten_model(model);
         identity = format!("{} {}", identity, short_model.dimmed());
+    }
+    // Append context remaining if available
+    if let Some(remaining) = ctx_remaining {
+        let ctx_str = format!("{}%ctx", remaining);
+        let colored_ctx = if remaining >= 50 {
+            ctx_str.dimmed().to_string()
+        } else if remaining >= 20 {
+            ctx_str.yellow().to_string()
+        } else {
+            ctx_str.red().to_string()
+        };
+        identity = format!("{} {}", identity, colored_ctx);
     }
     sections.push(identity);
 
@@ -241,13 +268,14 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // ── Section 9: Learning (patterns + knowledge) ──
+    // ── Section 9: Learning (patterns + knowledge + vectors) ──
     if let Some(ref db) = db {
         let short = db.count_patterns_short().unwrap_or(0);
         let long = db.count_patterns_long().unwrap_or(0);
         let memories = db.count_kv().unwrap_or(0);
+        let vectors = db.count_vectors().unwrap_or(0) as u64;
 
-        if short + long + memories > 0 {
+        if short + long + memories + vectors > 0 {
             let mut learn_parts = Vec::new();
             if long > 0 {
                 learn_parts.push(format!("{}", long).bright_yellow().to_string());
@@ -267,7 +295,27 @@ pub fn run() -> Result<()> {
                 String::new()
             };
 
-            let combined: Vec<_> = [pattern_str, mem_str]
+            // Show vector count with embedder type indicator
+            let vec_str = if vectors > 0 {
+                let embedder_tag = if config
+                    .as_ref()
+                    .map(|c| c.patterns.semantic_embeddings)
+                    .unwrap_or(false)
+                {
+                    "sem"
+                } else {
+                    "hash"
+                };
+                format!(
+                    "{}vec({})",
+                    format!("{}", vectors).bright_cyan(),
+                    embedder_tag.bright_cyan()
+                )
+            } else {
+                String::new()
+            };
+
+            let combined: Vec<_> = [pattern_str, mem_str, vec_str]
                 .into_iter()
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -441,6 +489,15 @@ pub fn print_legend() -> Result<()> {
     );
     let mem_example = format!("{}mem", "8".bright_yellow());
     println!("  {}       Stored key-value memories", mem_example);
+    let vec_example = format!(
+        "{}vec({})",
+        "500".bright_cyan(),
+        "sem".bright_cyan()
+    );
+    println!(
+        "  {}  HNSW vectors (sem=semantic, hash=hash embedder)",
+        vec_example
+    );
     println!();
 
     println!("{}", "WARNINGS".bold());

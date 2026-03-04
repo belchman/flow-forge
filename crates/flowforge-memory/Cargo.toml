@@ -3,6 +3,10 @@ name = "flowforge-memory"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["semantic"]
+semantic = ["fastembed"]
+
 [dependencies]
 flowforge-core = { workspace = true }
 serde = { workspace = true }
@@ -14,6 +18,10 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+fastembed = { workspace = true, optional = true }
+linfa = { workspace = true }
+linfa-clustering = { workspace = true }
+ndarray = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
