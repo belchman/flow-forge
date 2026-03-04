@@ -11,14 +11,14 @@ This project uses FlowForge for intelligent agent orchestration.
 ### Dual Memory System
 FlowForge uses BOTH a fast Rust-based memory system AND Claude's native auto-memory:
 
-**FlowForge Memory (fast, structured, searchable):**
-- SQLite + HNSW vector search for sub-millisecond pattern retrieval
+**FlowForge Memory (fast, semantic, searchable):**
+- SQLite + HNSW vector search with semantic embeddings (AllMiniLM-L6-v2) and DBSCAN topic clustering
 - Stores learned patterns, routing weights, session history, edit records
 - Use `flowforge memory set <key> <value>` for project-specific knowledge
 - Use `flowforge memory search <query>` to recall stored knowledge
 - Use `flowforge learn store "<pattern>" --category <cat>` for reusable patterns
 - Automatically learns from agent outcomes (routing weights, success rates)
-- MCP tools available: `memory_get`, `memory_set`, `memory_search`, `learning_store`
+- MCP tools available: `memory_get`, `memory_set`, `memory_search`, `learning_store`, `learning_clusters`
 
 **Claude's Auto-Memory (semantic, cross-session, natural language):**
 - Claude's built-in MEMORY.md and topic files for high-level insights

@@ -8,7 +8,7 @@ After any change, always run:
 
 ```bash
 cargo build --workspace              # Must compile with 0 warnings
-cargo test --workspace               # All 102 tests must pass
+cargo test --workspace               # All 120+ tests must pass
 cargo clippy --workspace -- -D warnings  # Must be clean
 cargo fmt --all --check              # Must be formatted
 ```
@@ -32,7 +32,7 @@ MCP tools are how Claude interacts with FlowForge during a session.
    - Parse parameters from `params`, call DB/core logic, return JSON result
 
 3. **Update the tool count test** in `crates/flowforge-mcp/src/server.rs`:
-   - Find `assert_eq!(tools.len(), 48)` and increment the count
+   - Find `assert_eq!(tools.len(), 53)` and increment the count
 
 4. **Update documentation**:
    - `README.md` — MCP Tools table, feature count in intro
@@ -179,7 +179,7 @@ The init command in `crates/flowforge-cli/src/commands/init.rs` sets up new proj
 | `crates/flowforge-core/src/trajectory.rs` | Trajectory types |
 | `crates/flowforge-memory/src/db.rs` | SQLite schema, all DB methods (~80 methods) |
 | `crates/flowforge-memory/src/trajectory.rs` | Trajectory judge (judgment, distillation, consolidation) |
-| `crates/flowforge-mcp/src/tools.rs` | MCP tool registry + dispatch (48 tools) |
+| `crates/flowforge-mcp/src/tools.rs` | MCP tool registry + dispatch (53 tools) |
 | `crates/flowforge-mcp/src/server.rs` | JSON-RPC server, tool count test |
 | `crates/flowforge-agents/src/registry.rs` | Agent loader (built-in + project + plugin) |
 | `.claude/settings.json` | Live hook wiring (must match init.rs template) |

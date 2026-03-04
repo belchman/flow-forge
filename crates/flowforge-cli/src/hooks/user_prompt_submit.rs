@@ -1,7 +1,7 @@
 use flowforge_agents::{AgentRegistry, AgentRouter};
 use flowforge_core::hook::{self, ContextOutput, UserPromptSubmitInput};
-use flowforge_core::{FlowForgeConfig, Result, RoutingContext};
-use flowforge_memory::MemoryDb;
+use flowforge_core::{FlowForgeConfig, PatternTier, Result, RoutingContext};
+use flowforge_memory::{MemoryDb, PatternStore};
 use std::collections::HashMap;
 
 pub fn run() -> Result<()> {
@@ -173,46 +173,45 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // Search FlowForge memory for relevant patterns and stored knowledge
+    // Search FlowForge memory using semantic vector search + cluster boosting
     if config.hooks.learning {
         if let Some(ref db) = db {
-            // Search learned patterns
-            if let Ok(patterns) = db.search_patterns_short(&prompt, 3) {
-                let relevant: Vec<_> = patterns
-                    .into_iter()
-                    .filter(|p| p.confidence > 0.5)
+            let store = PatternStore::new(db, &config.patterns);
+            if let Ok(matches) = store.search_all_patterns(&prompt, 5) {
+                let proven: Vec<_> = matches
+                    .iter()
+                    .filter(|m| m.tier == PatternTier::Long && m.confidence > 0.5)
                     .collect();
-                if !relevant.is_empty() {
-                    let mut pattern_ctx = String::from("[FlowForge Memory] Relevant patterns:");
-                    for p in &relevant {
-                        pattern_ctx.push_str(&format!(
-                            "\n- {} (conf: {:.0}%)",
-                            p.content,
-                            p.confidence * 100.0
-                        ));
-                    }
-                    context_parts.push(pattern_ctx);
-                }
-            }
+                let recent: Vec<_> = matches
+                    .iter()
+                    .filter(|m| m.tier == PatternTier::Short && m.confidence > 0.4)
+                    .collect();
 
-            // Also search long-term patterns for high-confidence knowledge
-            if let Ok(long_patterns) = db.search_patterns_long(&prompt, 3) {
-                let relevant: Vec<_> = long_patterns
-                    .into_iter()
-                    .filter(|p| p.confidence > 0.6)
-                    .collect();
-                if !relevant.is_empty() {
-                    let mut lt_ctx = String::from("[FlowForge Memory] Proven patterns:");
-                    for p in &relevant {
-                        lt_ctx.push_str(&format!(
-                            "\n- {} (conf: {:.0}%, used: {}x, success: {})",
+                if !proven.is_empty() {
+                    let mut ctx = String::from("[FlowForge Memory] Proven patterns:");
+                    for p in &proven {
+                        ctx.push_str(&format!(
+                            "\n- {} (conf: {:.0}%, sim: {:.0}%, used: {}x)",
                             p.content,
                             p.confidence * 100.0,
-                            p.usage_count,
-                            p.success_count
+                            p.similarity * 100.0,
+                            p.usage_count
                         ));
                     }
-                    context_parts.push(lt_ctx);
+                    context_parts.push(ctx);
+                }
+
+                if !recent.is_empty() {
+                    let mut ctx = String::from("[FlowForge Memory] Relevant patterns:");
+                    for p in &recent {
+                        ctx.push_str(&format!(
+                            "\n- {} (conf: {:.0}%, sim: {:.0}%)",
+                            p.content,
+                            p.confidence * 100.0,
+                            p.similarity * 100.0
+                        ));
+                    }
+                    context_parts.push(ctx);
                 }
             }
 

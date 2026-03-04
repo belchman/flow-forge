@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "flowforge hook session-start",
+            "timeout": 3000,
+            "type": "command"
+          }
+        ]
+      }
+    ],
     "Notification": [
       {
         "hooks": [

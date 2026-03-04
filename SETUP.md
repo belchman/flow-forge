@@ -92,9 +92,9 @@ flowforge plugin list
 flowforge (CLI binary, ~7.5MB)
 ├── flowforge-cli      # CLI commands + 13 hook handlers
 ├── flowforge-core     # Config, types, hook I/O, guidance engine, plugin loader, work tracking
-├── flowforge-memory   # SQLite DB, HNSW vectors, pattern learning, trajectory judge
+├── flowforge-memory   # SQLite DB, semantic vectors, DBSCAN clustering, pattern learning, trajectory judge
 ├── flowforge-agents   # 60 built-in agents, registry, router (+ plugin agents)
-├── flowforge-mcp      # MCP server (48 tools over JSON-RPC 2.0)
+├── flowforge-mcp      # MCP server (53 tools over JSON-RPC 2.0)
 └── flowforge-tmux     # tmux team monitor
 ```
 
@@ -118,12 +118,12 @@ All 13 Claude Code hook events are wired:
 | `Stop` | Ends active session |
 | `Notification` | Logs notifications to audit trail |
 
-## MCP Tools (48)
+## MCP Tools (53)
 
 Available when Claude connects to the FlowForge MCP server:
 
 **Memory:** `memory_get`, `memory_set`, `memory_delete`, `memory_list`, `memory_search`, `memory_import`
-**Learning:** `learning_store`, `learning_search`, `learning_feedback`, `learning_stats`
+**Learning:** `learning_store`, `learning_search`, `learning_feedback`, `learning_stats`, `learning_clusters`
 **Agents:** `agents_list`, `agents_info`, `agents_route`
 **Sessions:** `session_status`, `session_history`, `session_metrics`, `session_agents`
 **Conversations:** `conversation_history`, `conversation_search`, `conversation_ingest`
@@ -131,8 +131,8 @@ Available when Claude connects to the FlowForge MCP server:
 **Forks:** `session_fork`, `session_forks`, `session_lineage`
 **Mailbox:** `mailbox_send`, `mailbox_read`, `mailbox_history`, `mailbox_agents`
 **Team:** `team_status`, `team_log`
-**Work:** `work_create`, `work_list`, `work_update`, `work_log`, `work_claim`, `work_release`, `work_steal`, `work_heartbeat`
-**Guidance:** `guidance_rules`, `guidance_trust`, `guidance_audit`
+**Work:** `work_create`, `work_list`, `work_update`, `work_log`, `work_close`, `work_sync`, `work_load`, `work_claim`, `work_release`, `work_steal`, `work_heartbeat`
+**Guidance:** `guidance_rules`, `guidance_trust`, `guidance_audit`, `guidance_verify`
 **Plugins:** `plugin_list`, `plugin_info`
 **Trajectories:** `trajectory_list`, `trajectory_get`, `trajectory_judge`
 
@@ -146,6 +146,12 @@ FlowForge is configured via `.flowforge/config.toml`. Key sections:
 
 [patterns]
 # Pattern learning: short-term/long-term promotion, HNSW settings
+semantic_embeddings = true    # Use AllMiniLM-L6-v2 (false = hash-based fallback)
+clustering_min_points = 3     # DBSCAN minimum cluster size
+clustering_epsilon = 0.3      # DBSCAN distance threshold
+outlier_recluster_threshold = 50  # Recluster when this many outliers accumulate
+cluster_decay_active_factor = 0.5   # Active clusters decay slower
+cluster_decay_isolated_factor = 2.0 # Outliers decay faster
 trajectory_max = 5000
 trajectory_prune_days = 7
 
