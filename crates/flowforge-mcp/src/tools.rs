@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use flowforge_agents::{AgentRegistry, AgentRouter};
@@ -91,6 +92,10 @@ impl ToolRegistry {
             "trajectory_list" => self.trajectory_list(params),
             "trajectory_get" => self.trajectory_get(params),
             "trajectory_judge" => self.trajectory_judge(params),
+            "work_close" => self.work_close(params),
+            "work_sync" => self.work_sync(params),
+            "work_load" => self.work_load(params),
+            "guidance_verify" => self.guidance_verify(params),
             _ => json!({ "error": format!("unknown tool: {}", name) }),
         }
     }
@@ -708,6 +713,49 @@ impl ToolRegistry {
                     "id": { "type": "string", "description": "Trajectory ID" }
                 },
                 "required": ["id"]
+            }),
+        });
+
+        // Work close/sync/load tools
+        self.register(ToolDef {
+            name: "work_close".into(),
+            description: "Close a work item (set status to completed)".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Work item ID to close" }
+                },
+                "required": ["id"]
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "work_sync".into(),
+            description: "Sync work items with external backend (kanbus/beads/claude_tasks)".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        });
+
+        self.register(ToolDef {
+            name: "work_load".into(),
+            description: "Show work distribution across agents".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        });
+
+        // Guidance verify tool
+        self.register(ToolDef {
+            name: "guidance_verify".into(),
+            description: "Verify SHA-256 audit hash chain integrity".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session ID (optional, defaults to current)" }
+                }
             }),
         });
     }
@@ -2273,6 +2321,118 @@ impl ToolRegistry {
             Err(e) => json!({"status": "error", "message": format!("{e}")}),
         }
     }
+
+    // --- Work close/sync/load tool implementations ---
+
+    fn work_close(&self, params: &Value) -> Value {
+        let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            flowforge_core::work_tracking::close_item(&db, &config.work_tracking, id, "mcp")?;
+            Ok(())
+        }) {
+            Ok(()) => json!({"status": "ok", "id": id}),
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn work_sync(&self, _params: &Value) -> Value {
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            let pulled = flowforge_core::work_tracking::sync_from_backend(&db, &config.work_tracking)?;
+            let pushed = flowforge_core::work_tracking::push_to_backend(&db, &config.work_tracking)?;
+            let backend = flowforge_core::work_tracking::detect_backend(&config.work_tracking).to_string();
+            Ok((pulled, pushed, backend))
+        }) {
+            Ok((pulled, pushed, backend)) => json!({
+                "status": "ok",
+                "pulled": pulled,
+                "pushed": pushed,
+                "backend": backend
+            }),
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
+
+    fn work_load(&self, _params: &Value) -> Value {
+        match Self::open_db() {
+            Ok(db) => {
+                let filter = flowforge_core::WorkFilter {
+                    status: Some("in_progress".to_string()),
+                    limit: Some(1000),
+                    ..Default::default()
+                };
+                match db.list_work_items(&filter) {
+                    Ok(items) => {
+                        let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
+                        for item in &items {
+                            let agent = item.assignee.clone().or_else(|| item.claimed_by.clone()).unwrap_or_else(|| "unassigned".to_string());
+                            by_agent.entry(agent).or_default().push(json!({
+                                "id": item.id,
+                                "title": item.title,
+                                "type": item.item_type,
+                                "priority": item.priority,
+                                "progress": item.progress,
+                            }));
+                        }
+                        let agents: Vec<Value> = by_agent
+                            .into_iter()
+                            .map(|(name, items)| json!({"name": name, "items": items}))
+                            .collect();
+                        let total = items.len();
+                        json!({"status": "ok", "agents": agents, "total": total})
+                    }
+                    Err(e) => json!({"status": "error", "message": format!("{e}")}),
+                }
+            }
+            Err(e) => json!({"status": "error", "message": format!("Failed to open database: {e}")}),
+        }
+    }
+
+    // --- Guidance verify tool implementation ---
+
+    fn guidance_verify(&self, params: &Value) -> Value {
+        let session_id = params.get("session_id").and_then(|v| v.as_str());
+        match Self::load_config().and_then(|config| {
+            let db = MemoryDb::open(&config.db_path())?;
+            let sid = match session_id {
+                Some(s) => s.to_string(),
+                None => db
+                    .get_current_session()?
+                    .map(|s| s.id)
+                    .unwrap_or_else(|| "unknown".to_string()),
+            };
+            let decisions = db.get_gate_decisions_asc(&sid, 10000)?;
+            Ok(decisions)
+        }) {
+            Ok(decisions) => {
+                if decisions.is_empty() {
+                    return json!({"status": "ok", "valid": 0, "invalid": 0, "total": 0, "message": "no audit entries"});
+                }
+                let mut prev_hash = String::new();
+                let mut valid = 0u32;
+                let mut invalid = 0u32;
+                for d in &decisions {
+                    let expected_input = format!("{}{}{}{}", d.session_id, d.tool_name, d.reason, prev_hash);
+                    let expected_hash = format!("{:x}", Sha256::digest(expected_input.as_bytes()));
+                    if d.hash == expected_hash && d.prev_hash == prev_hash {
+                        valid += 1;
+                    } else {
+                        invalid += 1;
+                    }
+                    prev_hash = d.hash.clone();
+                }
+                let status = if invalid == 0 { "ok" } else { "broken" };
+                json!({
+                    "status": status,
+                    "valid": valid,
+                    "invalid": invalid,
+                    "total": valid + invalid
+                })
+            }
+            Err(e) => json!({"status": "error", "message": format!("{e}")}),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2280,9 +2440,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_registry_has_48_tools() {
+    fn test_registry_has_52_tools() {
         let registry = ToolRegistry::new();
-        assert_eq!(registry.list().len(), 48);
+        assert_eq!(registry.list().len(), 52);
     }
 
     #[test]
@@ -2318,5 +2478,65 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn test_new_tools_registered() {
+        let registry = ToolRegistry::new();
+        assert!(registry.get("work_close").is_some());
+        assert!(registry.get("work_sync").is_some());
+        assert!(registry.get("work_load").is_some());
+        assert!(registry.get("guidance_verify").is_some());
+    }
+
+    #[test]
+    fn test_work_close_requires_id() {
+        let registry = ToolRegistry::new();
+        let schema = &registry.get("work_close").unwrap().input_schema;
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v.as_str() == Some("id")));
+    }
+
+    #[test]
+    fn test_work_sync_no_required_params() {
+        let registry = ToolRegistry::new();
+        let schema = &registry.get("work_sync").unwrap().input_schema;
+        assert!(schema.get("required").is_none());
+    }
+
+    #[test]
+    fn test_guidance_verify_optional_session_id() {
+        let registry = ToolRegistry::new();
+        let schema = &registry.get("guidance_verify").unwrap().input_schema;
+        assert!(schema.get("required").is_none());
+        assert!(schema["properties"]["session_id"].is_object());
+    }
+
+    #[test]
+    fn test_work_close_call_returns_status() {
+        let registry = ToolRegistry::new();
+        let result = registry.call("work_close", &json!({"id": "test-id"}));
+        assert!(result.get("status").is_some());
+    }
+
+    #[test]
+    fn test_work_sync_call_returns_status() {
+        let registry = ToolRegistry::new();
+        let result = registry.call("work_sync", &json!({}));
+        assert!(result.get("status").is_some());
+    }
+
+    #[test]
+    fn test_work_load_call_returns_status() {
+        let registry = ToolRegistry::new();
+        let result = registry.call("work_load", &json!({}));
+        assert!(result.get("status").is_some());
+    }
+
+    #[test]
+    fn test_guidance_verify_call_returns_status() {
+        let registry = ToolRegistry::new();
+        let result = registry.call("guidance_verify", &json!({}));
+        assert!(result.get("status").is_some());
     }
 }

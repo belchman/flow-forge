@@ -2047,6 +2047,46 @@ impl MemoryDb {
             .map_err(|e| Error::Sqlite(e.to_string()))
     }
 
+    pub fn get_gate_decisions_asc(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<GateDecision>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, rule_id, gate_name, tool_name, action, reason, risk_level,
+                        trust_before, trust_after, timestamp, hash, prev_hash
+                 FROM gate_decisions WHERE session_id = ?1
+                 ORDER BY id ASC LIMIT ?2",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id, limit], |row| {
+                Ok(GateDecision {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    rule_id: row.get(2)?,
+                    gate_name: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    action: row
+                        .get::<_, String>(5)?
+                        .parse()
+                        .unwrap_or(GateAction::Allow),
+                    reason: row.get(6)?,
+                    risk_level: row.get::<_, String>(7)?.parse().unwrap_or(RiskLevel::Low),
+                    trust_before: row.get(8)?,
+                    trust_after: row.get(9)?,
+                    timestamp: parse_datetime(row.get::<_, String>(10)?),
+                    hash: row.get(11)?,
+                    prev_hash: row.get(12)?,
+                })
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
     // ── Work-Stealing ──
 
     pub fn claim_work_item(&self, id: &str, session_id: &str) -> Result<bool> {
@@ -2905,5 +2945,63 @@ mod tests {
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
         assert_eq!(fk_status, 1);
+    }
+
+    #[test]
+    fn test_gate_decisions_asc_order() {
+        use sha2::{Digest, Sha256};
+
+        let db = test_db();
+        let session_id = "test-session";
+
+        // Build a 3-entry hash chain
+        let mut prev_hash = String::new();
+        let tools = ["Bash", "Read", "Edit"];
+        for (i, tool) in tools.iter().enumerate() {
+            let reason = format!("reason-{}", i);
+            let input = format!("{}{}{}{}", session_id, tool, reason, prev_hash);
+            let hash = format!("{:x}", Sha256::digest(input.as_bytes()));
+            let decision = GateDecision {
+                id: 0,
+                session_id: session_id.to_string(),
+                rule_id: Some(format!("rule-{}", i)),
+                gate_name: "test_gate".to_string(),
+                tool_name: tool.to_string(),
+                action: GateAction::Allow,
+                reason,
+                risk_level: RiskLevel::Low,
+                trust_before: 1.0,
+                trust_after: 1.0,
+                timestamp: Utc::now(),
+                hash: hash.clone(),
+                prev_hash: prev_hash.clone(),
+            };
+            db.record_gate_decision(&decision).unwrap();
+            prev_hash = hash;
+        }
+
+        // ASC should return in insertion order
+        let asc = db.get_gate_decisions_asc(session_id, 100).unwrap();
+        assert_eq!(asc.len(), 3);
+        assert_eq!(asc[0].tool_name, "Bash");
+        assert_eq!(asc[1].tool_name, "Read");
+        assert_eq!(asc[2].tool_name, "Edit");
+
+        // Verify the chain is valid when walked in ASC order
+        let mut prev = String::new();
+        for d in &asc {
+            let expected_input = format!("{}{}{}{}", d.session_id, d.tool_name, d.reason, prev);
+            let expected_hash = format!("{:x}", Sha256::digest(expected_input.as_bytes()));
+            assert_eq!(d.hash, expected_hash, "hash mismatch at {}", d.tool_name);
+            assert_eq!(d.prev_hash, prev, "prev_hash mismatch at {}", d.tool_name);
+            prev = d.hash.clone();
+        }
+
+        // DESC should return in reverse order
+        let desc = db.get_gate_decisions(session_id, 100).unwrap();
+        assert_eq!(desc.len(), 3);
+        assert_eq!(desc[0].tool_name, "Edit");
+        assert_eq!(desc[1].tool_name, "Read");
+        assert_eq!(desc[2].tool_name, "Bash");
     }
 }

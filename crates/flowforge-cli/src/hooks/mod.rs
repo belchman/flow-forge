@@ -50,10 +50,16 @@ pub fn run_safe(
 
 fn log_hook_error(hook_name: &str, msg: &str) {
     use std::io::Write;
+    // Write to project-local log if .flowforge/ exists, otherwise /tmp/
+    let path = if std::path::Path::new(".flowforge").is_dir() {
+        ".flowforge/hook-errors.log".to_string()
+    } else {
+        "/tmp/flowforge-hook-errors.log".to_string()
+    };
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/flowforge-hook-errors.log")
+        .open(&path)
     {
         let _ = writeln!(f, "[{}] {}: {}", chrono::Utc::now(), hook_name, msg);
     }

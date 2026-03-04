@@ -41,7 +41,7 @@ FlowForge uses BOTH a fast Rust-based memory system AND Claude's native auto-mem
 - Use `flowforge work stealable` / `flowforge work steal` for redistribution
 - Use `flowforge work load` to see work distribution across agents
 - Supported backends: Claude Tasks, Beads, Kanbus (auto-detected)
-- MCP tools: `work_create`, `work_list`, `work_update`, `work_log`, `work_claim`, `work_release`, `work_steal`, `work_heartbeat`
+- MCP tools: `work_create`, `work_list`, `work_update`, `work_log`, `work_close`, `work_sync`, `work_load`, `work_claim`, `work_release`, `work_steal`, `work_heartbeat`
 
 ### Guidance Control Plane
 - Enforces configurable safety rules on ALL tool uses via `pre_tool_use` hook
@@ -51,7 +51,7 @@ FlowForge uses BOTH a fast Rust-based memory system AND Claude's native auto-mem
 - Use `flowforge guidance rules` to see active gates
 - Use `flowforge guidance trust` to check session trust score
 - Use `flowforge guidance audit` / `flowforge guidance verify` for audit trail
-- MCP tools: `guidance_rules`, `guidance_trust`, `guidance_audit`
+- MCP tools: `guidance_rules`, `guidance_trust`, `guidance_audit`, `guidance_verify`
 
 ### Plugin SDK
 - Extend FlowForge with custom tools, hooks, and agents without recompilation
@@ -79,6 +79,11 @@ FlowForge uses BOTH a fast Rust-based memory system AND Claude's native auto-mem
 ### tmux Monitor
 - Run `flowforge tmux start` for real-time team monitoring
 - The monitor updates automatically via hooks
+
+### Slash Commands
+- `/status` — Unified project dashboard (work, learning, trust, agents)
+- `/test-hooks` — Run hook tests with diagnostics
+- `/setup` — Project initialization wizard (build, install, init, verify)
 
 ### Available Agents
 - Run `flowforge agent list` to see all available agents

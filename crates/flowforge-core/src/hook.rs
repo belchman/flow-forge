@@ -280,12 +280,14 @@ pub fn read_stdin() -> crate::Result<String> {
 
 /// Parse hook input from stdin as raw JSON Value.
 /// All hook types now use Value-based extraction to avoid serde flatten bugs.
+/// Returns an empty object `{}` if stdin is empty or contains invalid JSON,
+/// so hooks gracefully degrade when Claude Code doesn't pipe a payload.
 pub fn parse_stdin_value() -> crate::Result<Value> {
     let input = read_stdin()?;
     if input.trim().is_empty() {
-        return Err(crate::Error::Hook("Empty stdin input".to_string()));
+        return Ok(Value::Object(Default::default()));
     }
-    serde_json::from_str(&input).map_err(|e| crate::Error::Hook(format!("Invalid JSON input: {e}")))
+    Ok(serde_json::from_str(&input).unwrap_or_else(|_| Value::Object(Default::default())))
 }
 
 /// Helper: get a required string field from JSON, returning a hook error if missing.
