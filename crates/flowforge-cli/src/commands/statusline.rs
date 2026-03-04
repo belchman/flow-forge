@@ -76,26 +76,20 @@ pub fn run() -> Result<()> {
     let mut lines = Vec::new();
 
     // ══════════════════════════════════════════════════════════════
-    // LINE 1: Header — brand + user + git + model + context + duration
+    // LINE 1: Header — brand + git + model + context + duration
     // ══════════════════════════════════════════════════════════════
     let display_name = session_name.unwrap_or(&project_name);
-    let mut header = format!(
+    let mut header_parts: Vec<String> = vec![format!(
         "{} {}",
         "\u{258A}".bold().bright_magenta(), // ▊
         format!("FlowForge {}", display_name)
             .bold()
             .bright_magenta()
-    );
+    )];
 
     // Git branch + changes
     if let Some(ref branch) = git_branch {
-        header = format!(
-            "{}  {}  {} {}",
-            header,
-            SEP.dimmed(),
-            "\u{23C7}".bright_blue(), // ⏇
-            branch.bright_blue()
-        );
+        let mut git_str = branch.bright_blue().to_string();
         let mut changes = Vec::new();
         if staged > 0 {
             changes.push(format!("+{}", staged).bright_green().to_string());
@@ -107,35 +101,30 @@ pub fn run() -> Result<()> {
             changes.push(format!("?{}", untracked).dimmed().to_string());
         }
         if !changes.is_empty() {
-            header = format!("{} {}", header, changes.join(""));
+            git_str = format!("{} {}", git_str, changes.join(""));
         }
+        header_parts.push(git_str);
     }
 
-    // Model (shorten common Claude model IDs)
+    // Model
     if !model.is_empty() {
-        let short_model = shorten_model(model);
-        header = format!(
-            "{}  {}  {}",
-            header,
-            SEP.dimmed(),
-            short_model.bright_magenta()
-        );
+        header_parts.push(shorten_model(model).bright_magenta().to_string());
     }
 
     // Context remaining
     if let Some(remaining) = ctx_remaining {
         let ctx_used = 100u32.saturating_sub(remaining);
-        let ctx_str = format!("\u{1F4C2} {}%", ctx_used); // 📂
+        let ctx_str = format!("ctx {}%", ctx_used);
         let colored = if ctx_used < 50 {
-            ctx_str.bright_green().to_string()
+            ctx_str.bright_green()
         } else if ctx_used < 70 {
-            ctx_str.bright_cyan().to_string()
+            ctx_str.bright_cyan()
         } else if ctx_used < 85 {
-            ctx_str.bright_yellow().to_string()
+            ctx_str.bright_yellow()
         } else {
-            ctx_str.bright_red().to_string()
+            ctx_str.bright_red()
         };
-        header = format!("{}  {}  {}", header, SEP.dimmed(), colored);
+        header_parts.push(colored.to_string());
     }
 
     // Session duration
@@ -144,71 +133,56 @@ pub fn run() -> Result<()> {
             let secs = chrono::Utc::now()
                 .signed_duration_since(session.started_at)
                 .num_seconds();
-            let dur = format_duration(secs);
-            header = format!(
-                "{}  {}  {}{}",
-                header,
-                SEP.dimmed(),
-                "\u{23F1}".cyan(), // ⏱
-                dur.cyan()
-            );
+            header_parts.push(format_duration(secs).cyan().to_string());
         }
     }
 
-    lines.push(header);
+    let sep = format!("  {}  ", SEP.dimmed());
+    lines.push(header_parts.join(&sep));
 
     // Separator
     lines.push(HSEP.repeat(53).dimmed().to_string());
 
     // ══════════════════════════════════════════════════════════════
-    // LINE 2: Learning — patterns + vectors + HNSW + intelligence
+    // LINE 2: Learn — pattern progress + clusters + routes + IQ
     // ══════════════════════════════════════════════════════════════
     if let Some(ref db) = db {
         let short = db.count_patterns_short().unwrap_or(0);
         let long = db.count_patterns_long().unwrap_or(0);
-        let vectors = db.count_vectors().unwrap_or(0) as u64;
         let clusters = db.get_all_clusters().map(|c| c.len()).unwrap_or(0);
         let routes = db.count_routing_weights().unwrap_or(0);
+        let vectors = db.count_vectors().unwrap_or(0) as u64;
 
-        let is_semantic = config
-            .as_ref()
-            .map(|c| c.patterns.semantic_embeddings)
-            .unwrap_or(false);
+        let intel = compute_intelligence(short, long, vectors, clusters as u64, routes, Some(db));
 
-        // Pattern progress bar (short→long promotion)
-        let total_patterns = short + long;
-        let long_ratio = if total_patterns > 0 {
-            long as f64 / total_patterns as f64
-        } else {
-            0.0
-        };
-        let pat_bar = progress_bar(long_ratio, 5);
-        let pat_color = if long > 10 {
+        let mut learn_parts: Vec<String> = Vec::new();
+
+        // Pattern counts: "N proven  N recent"
+        let long_str = if long > 10 {
             format!("{}", long).bright_green().to_string()
         } else if long > 0 {
             format!("{}", long).yellow().to_string()
         } else {
-            format!("{}", long).red().to_string()
+            "0".dimmed().to_string()
         };
+        learn_parts.push(format!(
+            "{} proven  {} recent",
+            long_str,
+            format!("{}", short).dimmed()
+        ));
 
-        // HNSW performance indicator
-        let hnsw_str = if vectors > 10000 {
-            format!("{} HNSW 12500x", "\u{26A1}") // ⚡
-                .bright_green()
-                .to_string()
-        } else if vectors > 1000 {
-            format!("{} HNSW 150x", "\u{26A1}")
-                .bright_green()
-                .to_string()
-        } else if vectors > 0 {
-            format!("{} HNSW", "\u{26A1}").bright_yellow().to_string()
-        } else {
-            format!("{} brute", "\u{26A1}").dimmed().to_string()
-        };
+        // Clusters
+        if clusters > 0 {
+            learn_parts.push(format!("{} clusters", clusters).bright_green().to_string());
+        }
 
-        // Intelligence score: composite of patterns, vectors, routes, clusters
-        let intel = compute_intelligence(short, long, vectors, clusters as u64, routes);
-        let intel_str = format!("{}%", intel);
+        // Routes
+        if routes > 0 {
+            learn_parts.push(format!("{} routes", routes).bright_green().to_string());
+        }
+
+        // Intelligence score
+        let intel_str = format!("IQ {}%", intel);
         let intel_colored = if intel >= 80 {
             intel_str.bright_green().to_string()
         } else if intel >= 40 {
@@ -216,155 +190,165 @@ pub fn run() -> Result<()> {
         } else {
             intel_str.dimmed().to_string()
         };
-
-        let embedder_tag = if is_semantic {
-            "sem384".bright_cyan().to_string()
-        } else {
-            "hash".dimmed().to_string()
-        };
+        learn_parts.push(intel_colored);
 
         lines.push(format!(
-            "{} {}    {}  {}/{}    {} {}{} {}    {} {}    {} \u{25CF} {}",
-            "\u{1F4DA}".bright_cyan(), // 📚
-            "Patterns".bright_cyan(),
-            pat_bar,
-            pat_color,
-            format!("{}", short).dimmed(),
-            "\u{1F9EC}".bright_cyan(), // 🧬
-            format!("{}", vectors).bright_green(),
-            embedder_tag,
-            hnsw_str,
-            "\u{1F9E9}".bright_cyan(), // 🧩
-            if clusters > 0 {
-                format!("{}c", clusters).bright_green().to_string()
-            } else {
-                "0c".dimmed().to_string()
-            },
-            "\u{1F9E0}".bright_cyan(), // 🧠
-            intel_colored,
+            "{}  {}",
+            "Learn:".bright_cyan(),
+            learn_parts.join("  ")
         ));
     }
 
     // ══════════════════════════════════════════════════════════════
-    // LINE 3: Swarm — agents + trust + work + mail + routes
+    // LINE 3: Swarm — agents + trust + trajectory + work + warnings
     // ══════════════════════════════════════════════════════════════
     if let Some(ref db) = db {
-        let mut swarm_parts = Vec::new();
+        let mut swarm_parts: Vec<String> = Vec::new();
 
-        // Agents
+        // Agents: "N active (names)" or "no agents"
         let (active_count, idle_count, agent_names) = get_agent_summary(db);
-        let swarm_dot = if active_count > 0 {
-            "\u{25C9}".bright_green().to_string() // ◉
+        let total = active_count + idle_count;
+        if total > 0 {
+            swarm_parts.push(format!(
+                "{} active ({})",
+                format!("{}", active_count).bright_green(),
+                if !agent_names.is_empty() {
+                    agent_names.join(" ")
+                } else {
+                    "--".dimmed().to_string()
+                }
+            ));
         } else {
-            "\u{25CB}".dimmed().to_string() // ○
-        };
-        swarm_parts.push(format!(
-            "{} {} [{}/{}]  {} {}",
-            "\u{1F916}".bright_yellow(), // 🤖
-            "Swarm".bright_yellow(),
-            swarm_dot,
-            if active_count + idle_count > 0 {
-                format!("{}", active_count + idle_count)
-                    .bright_green()
-                    .to_string()
-            } else {
-                "0".dimmed().to_string()
-            },
-            "\u{1F465}".bright_purple(), // 👥
-            if !agent_names.is_empty() {
-                agent_names.join(" ")
-            } else {
-                "--".dimmed().to_string()
-            },
-        ));
+            swarm_parts.push("no agents".dimmed().to_string());
+        }
 
-        // Session-dependent metrics (trust, trajectory, mail)
+        // Session-dependent metrics
         if let Ok(Some(session)) = db.get_current_session() {
             let sid = &session.id;
 
             // Trust score
             if let Ok(Some(trust)) = db.get_trust_score(sid) {
                 let trust_pct = (trust.score * 100.0) as u32;
-                let trust_str = format!("{}%", trust_pct);
-                let colored = color_by_trust(trust.score, &trust_str);
-                let shield = color_by_trust(trust.score, "\u{1F6E1}\u{FE0F}"); // 🛡️
-                let mut detail = format!("{} {}", shield, colored);
+                let trust_str = format!("trust {}%", trust_pct);
+                let mut detail = color_by_trust(trust.score, &trust_str);
                 if trust.denials > 0 {
-                    detail = format!("{} {}", detail, format!("{}d", trust.denials).red());
+                    detail = format!("{} {}", detail, format!("{}deny", trust.denials).red());
                 }
                 swarm_parts.push(detail);
             }
 
-            // Trajectory
+            // Trajectory progress
             if let Ok(Some(traj)) = db.get_active_trajectory(sid) {
                 let steps = db.get_trajectory_steps(&traj.id).unwrap_or_default();
-                let total = steps.len();
-                if total > 0 {
+                let step_count = steps.len();
+                if step_count > 0 {
                     let successes = steps
                         .iter()
                         .filter(|s| s.outcome == flowforge_core::trajectory::StepOutcome::Success)
                         .count();
-                    let ratio = successes as f64 / total as f64;
+                    let ratio = successes as f64 / step_count as f64;
                     let bar = progress_bar(ratio, 4);
                     let pct = format!("{}%", (ratio * 100.0) as u32);
                     let colored = color_by_ratio(ratio, &pct);
-                    swarm_parts.push(format!("{}{} {}", "\u{25B6}".dimmed(), bar, colored));
+                    swarm_parts.push(format!("traj {}{}", bar, colored));
                 }
             }
 
             // Unread mail
             if let Ok(unread) = db.get_unread_messages(sid) {
                 if !unread.is_empty() {
-                    swarm_parts.push(format!(
-                        "{} {}",
-                        "\u{1F4E8}".bright_yellow(), // 📨
-                        format!("{}", unread.len()).bright_yellow()
-                    ));
+                    swarm_parts.push(format!("{} mail", unread.len()).bright_yellow().to_string());
                 }
             }
 
-            // Session edits + commands
+            // Session activity
             if session.edits > 0 || session.commands > 0 {
                 let mut activity = Vec::new();
                 if session.edits > 0 {
-                    activity.push(format!("\u{270E}{}", session.edits).yellow().to_string());
+                    activity.push(format!("{} edits", session.edits));
                 }
                 if session.commands > 0 {
-                    activity.push(format!("\u{2318}{}", session.commands).to_string());
+                    activity.push(format!("{} cmds", session.commands));
                 }
-                swarm_parts.push(activity.join(" "));
+                swarm_parts.push(activity.join(" ").dimmed().to_string());
             }
         }
 
-        // Work items (outside session scope — always show)
+        // Work items
         let wip = db.count_work_items_by_status("in_progress").unwrap_or(0);
         let pending = db.count_work_items_by_status("pending").unwrap_or(0);
         if wip > 0 || pending > 0 {
             let mut w = Vec::new();
             if wip > 0 {
-                w.push(format!("{}wip", wip).bright_blue().to_string());
+                w.push(format!("{} work active", wip));
             }
             if pending > 0 {
-                w.push(format!("{}q", pending).dimmed().to_string());
+                w.push(format!("{} work pending", pending));
             }
-            swarm_parts.push(format!("{} {}", "\u{2690}".bright_blue(), w.join(" ")));
+            swarm_parts.push(w.join("  ").bright_blue().to_string());
         }
 
-        lines.push(swarm_parts.join("    "));
+        // Warnings (keep prominent, not buried in debug)
+        let mut warn_parts = Vec::new();
+        if let Ok(stealable) = db.get_stealable_items(5) {
+            if !stealable.is_empty() {
+                warn_parts.push(format!("{} stale", stealable.len()).yellow().to_string());
+            }
+        }
+        let log_path = FlowForgeConfig::project_dir().join("hook-errors.log");
+        if log_path.exists() {
+            if let Ok(meta) = std::fs::metadata(&log_path) {
+                if meta.len() > 0 {
+                    warn_parts.push("hook-err".red().to_string());
+                }
+            }
+        }
+        if !warn_parts.is_empty() {
+            swarm_parts.push(format!("!! {}", warn_parts.join(" ")));
+        }
+
+        lines.push(format!(
+            "{}  {}",
+            "Swarm:".bright_yellow(),
+            swarm_parts.join("  ")
+        ));
     }
 
     // ══════════════════════════════════════════════════════════════
-    // LINE 4: Architecture — subsystem status indicators
+    // LINE 4: Debug — infrastructure internals (dimmed)
     // ══════════════════════════════════════════════════════════════
     if let Some(ref db) = db {
-        let routes = db.count_routing_weights().unwrap_or(0);
-        let memories = db.count_kv().unwrap_or(0);
         let vectors = db.count_vectors().unwrap_or(0) as u64;
+        let memories = db.count_kv().unwrap_or(0);
 
         let is_semantic = config
             .as_ref()
             .map(|c| c.patterns.semantic_embeddings)
             .unwrap_or(false);
+
+        let embedder = if is_semantic { "sem384" } else { "hash128" };
+
+        let hnsw = if vectors > 10000 {
+            "HNSW:12500x"
+        } else if vectors > 1000 {
+            "HNSW:150x"
+        } else if vectors > 0 {
+            "HNSW"
+        } else {
+            "brute"
+        };
+
+        // DB size
+        let db_size = config
+            .as_ref()
+            .and_then(|c| std::fs::metadata(c.db_path()).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let db_str = if db_size > 1024 * 1024 {
+            format!("{:.1}MB", db_size as f64 / (1024.0 * 1024.0))
+        } else {
+            format!("{}KB", db_size / 1024)
+        };
 
         // Hooks count
         let hooks_path = std::env::current_dir()
@@ -380,104 +364,28 @@ pub fn run() -> Result<()> {
         } else {
             0
         };
-        let hooks_color = if hooks_count >= 12 {
-            format!("\u{2713}{}h", hooks_count)
-                .bright_green()
-                .to_string()
-        } else if hooks_count > 0 {
-            format!("\u{2713}{}h", hooks_count)
-                .bright_yellow()
-                .to_string()
-        } else {
-            "\u{2713}0h".dimmed().to_string()
-        };
 
-        // MCP tools count
+        // MCP
         let mcp_path = std::env::current_dir()
             .unwrap_or_default()
             .join(".mcp.json");
-        let mcp_active = mcp_path.exists();
-        let mcp_str = if mcp_active {
-            "MCP53".bright_green().to_string()
-        } else {
-            "MCP--".dimmed().to_string()
-        };
+        let mcp_str = if mcp_path.exists() { "MCP53" } else { "MCP--" };
 
-        // DB size
-        let db_size = config
-            .as_ref()
-            .and_then(|c| std::fs::metadata(c.db_path()).ok())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let db_str = if db_size > 1024 * 1024 {
-            format!("{:.1}MB", db_size as f64 / (1024.0 * 1024.0))
-        } else {
-            format!("{}KB", db_size / 1024)
-        };
+        let debug_parts = [
+            embedder.to_string(),
+            format!("{}vec", vectors),
+            hnsw.to_string(),
+            db_str,
+            format!("{}hooks", hooks_count),
+            mcp_str.to_string(),
+            format!("{}kv", memories),
+        ];
 
-        // Embedder indicator
-        let embed_dot = if is_semantic {
-            "\u{25CF}".bright_green().to_string() // ●
-        } else {
-            "\u{25CF}".dimmed().to_string()
-        };
-        let embed_label = if is_semantic {
-            "Semantic".bright_green().to_string()
-        } else {
-            "Hash".dimmed().to_string()
-        };
-
-        // Warnings
-        let mut warn_parts = Vec::new();
-        if let Ok(stealable) = db.get_stealable_items(5) {
-            if !stealable.is_empty() {
-                warn_parts.push(format!("{}stale", stealable.len()).yellow().to_string());
-            }
-        }
-        let log_path = FlowForgeConfig::project_dir().join("hook-errors.log");
-        if log_path.exists() {
-            if let Ok(meta) = std::fs::metadata(&log_path) {
-                if meta.len() > 0 {
-                    warn_parts.push("err".red().to_string());
-                }
-            }
-        }
-
-        let warn_str = if warn_parts.is_empty() {
-            String::new()
-        } else {
-            format!("    {} {}", "\u{26A0}".bright_red(), warn_parts.join(" "))
-        };
-
-        lines.push(format!(
-            "{} {}    {} {}{}  {}  {} {}  {}  {} {}  {}  {} {} {}  {}  {}{}",
-            "\u{1F527}".bright_purple(), // 🔧
-            "Arch".bright_purple(),
-            "Embed".cyan(),
-            embed_dot,
-            embed_label,
-            SEP.dimmed(),
-            "Vectors".cyan(),
-            if vectors > 0 {
-                format!("\u{25CF}{}", vectors).bright_green().to_string()
-            } else {
-                "\u{25CF}0".dimmed().to_string()
-            },
-            SEP.dimmed(),
-            "DB".cyan(),
-            db_str.bright_white(),
-            SEP.dimmed(),
-            "Routes".cyan(),
-            if routes > 0 {
-                format!("\u{25CF}{}", routes).bright_green().to_string()
-            } else {
-                "\u{25CF}0".dimmed().to_string()
-            },
-            format!("{}kv", memories).dimmed(),
-            SEP.dimmed(),
-            format!("{}  {}", hooks_color, mcp_str),
-            warn_str,
-        ));
+        lines.push(
+            format!("debug:  {}", debug_parts.join("  "))
+                .dimmed()
+                .to_string(),
+        );
     }
 
     // Footer separator
@@ -502,79 +410,48 @@ pub fn print_legend() -> Result<()> {
         "\u{258A}".bold().bright_magenta(),
         "FlowForge".bold().bright_magenta()
     );
-    println!(
-        "  {} branch     Git branch with +staged ~modified ?untracked",
-        "\u{23C7}".bright_blue()
-    );
-    println!(
-        "  {}            Model name (Opus 4.6, Sonnet 4.6, etc.)",
-        "model".bright_magenta()
-    );
-    println!(
-        "  {} 23%        Context window usage (green<50 cyan<70 yellow<85 red)",
-        "\u{1F4C2}"
-    );
-    println!("  {}5m          Session duration", "\u{23F1}".cyan());
+    println!("  branch       Git branch with +staged ~modified ?untracked");
+    println!("  op4.6        Model name (Opus 4.6, Sonnet 4.6, etc.)");
+    println!("  ctx 23%      Context window usage (green<50 cyan<70 yellow<85 red)");
+    println!("  5m           Session duration");
     println!();
 
-    println!("{}", "LEARNING LINE".bold());
-    println!(
-        "  {} 5          Progress bar: long-term / short-term promotion",
-        progress_bar(0.5, 5)
-    );
-    println!(
-        "  {} 500sem384  HNSW vector count + embedder type",
-        "\u{1F9EC}"
-    );
-    println!(
-        "  {} HNSW 150x  Vector index speedup indicator",
-        "\u{26A1}".bright_green()
-    );
-    println!("  {} 3c         DBSCAN topic clusters", "\u{1F9E9}");
-    println!(
-        "  {} 65%        Intelligence score (patterns + vectors + routes + clusters)",
-        "\u{1F9E0}"
-    );
+    println!("{}", "LEARN LINE".bold());
+    println!("  N proven     Long-term patterns (promoted from short-term)");
+    println!("  N recent     Short-term patterns (not yet promoted)");
+    println!("  N clusters   DBSCAN topic clusters");
+    println!("  N routes     Learned agent routing weights");
+    println!("  IQ N%        Intelligence score (70% outcomes + 30% volume)");
     println!();
 
     println!("{}", "SWARM LINE".bold());
+    println!("  N active     Active agents with shortened names");
+    println!("  trust N%     Guidance trust score (green>=80 yellow>=50 red)");
     println!(
-        "  {} [0/2]      Active agent count + total, named agents",
-        "\u{1F916}"
-    );
-    println!(
-        "  {} 85%        Guidance trust score (green>=80 yellow>=50 red)",
-        "\u{1F6E1}\u{FE0F}"
-    );
-    println!(
-        "  {}{}85%   Trajectory success ratio bar",
-        "\u{25B6}".dimmed(),
+        "  traj {}N%  Trajectory success ratio bar",
         progress_bar(0.85, 4)
     );
+    println!("  N mail       Unread co-agent messages");
+    println!("  N edits      File edits this session");
+    println!("  N cmds       Commands run this session");
+    println!("  N work active   In-progress work items");
+    println!("  N work pending  Pending work items");
+    println!("  !! stale     Stealable work items (warning)");
     println!(
-        "  {} 2wip 1q    In-progress and queued work items",
-        "\u{2690}".bright_blue()
+        "  !! {}    Hook error log not empty (warning)",
+        "hook-err".red()
     );
-    println!("  {} 3          Unread co-agent messages", "\u{1F4E8}");
     println!();
 
-    println!("{}", "ARCHITECTURE LINE".bold());
-    println!(
-        "  Embed        {}Semantic or {}Hash embedder",
-        "\u{25CF}".bright_green(),
-        "\u{25CF}".dimmed()
-    );
-    println!("  Vectors      HNSW entry count");
-    println!("  DB           Database file size");
-    println!("  Routes       Learned routing weights + KV memories");
-    println!(
-        "  {}          Hooks wired / MCP server status",
-        "\u{2713}13h MCP53".bright_green()
-    );
-    println!(
-        "  {} stale err  Stealable work items / hook errors",
-        "\u{26A0}".bright_red()
-    );
+    println!("{}", "DEBUG LINE (infrastructure)".bold());
+    println!("  sem384       Semantic embedder (AllMiniLM, 384-dim)");
+    println!("  hash128      Hash embedder (xxhash n-gram, 128-dim)");
+    println!("  Nvec         Vector count in HNSW index");
+    println!("  HNSW:Nx      Index speedup tier (brute / HNSW / HNSW:150x / HNSW:12500x)");
+    println!("  N.NMB        Database file size");
+    println!("  Nhooks       Claude Code hooks wired");
+    println!("  MCPN         MCP server tool count");
+    println!("  Nkv          Key-value memory entries");
     println!();
 
     println!(
@@ -661,28 +538,80 @@ fn parse_git_porcelain(output: &str) -> (u32, u32, u32) {
     (staged, modified, untracked)
 }
 
-/// Compute intelligence score (0-100) from learning metrics
+/// Outcome metrics for intelligence score v2
+struct OutcomeMetrics {
+    trajectory_success_rate: f64,
+    routing_accuracy: f64,
+    routing_total: u64,
+    promotion_rate: f64,
+    route_count: u64,
+}
+
+fn get_outcome_metrics(db: &MemoryDb) -> OutcomeMetrics {
+    let trajectory_success_rate = db.recent_trajectory_success_rate(20).unwrap_or(0.0);
+    let (routing_hits, routing_total) = db.routing_accuracy_stats().unwrap_or((0, 0));
+    let routing_accuracy = if routing_total > 0 {
+        routing_hits as f64 / routing_total as f64
+    } else {
+        0.0
+    };
+
+    let short = db.count_patterns_short().unwrap_or(0);
+    let long = db.count_patterns_long().unwrap_or(0);
+    let total_patterns = short + long;
+    let promotion_rate = if total_patterns > 0 {
+        long as f64 / total_patterns as f64
+    } else {
+        0.0
+    };
+
+    let route_count = db.count_routing_weights().unwrap_or(0);
+
+    OutcomeMetrics {
+        trajectory_success_rate,
+        routing_accuracy,
+        routing_total,
+        promotion_rate,
+        route_count,
+    }
+}
+
+/// Compute intelligence score (0-100) — outcome-based (70%) + volume (30%)
 fn compute_intelligence(
     short_patterns: u64,
     long_patterns: u64,
     vectors: u64,
     clusters: u64,
-    routes: u64,
+    _routes: u64,
+    db: Option<&MemoryDb>,
 ) -> u32 {
-    // Pattern maturity: long-term patterns are worth more
-    let pattern_score = ((short_patterns as f64 * 0.2) + (long_patterns as f64 * 2.0)).min(40.0);
-    // Vector density: more vectors = better recall
+    // Volume (30%): patterns (15 max) + vectors (10 max) + clusters (5 max)
+    let pattern_score = ((short_patterns as f64 * 0.1) + (long_patterns as f64 * 1.0)).min(15.0);
     let vector_score = if vectors > 0 {
-        ((vectors as f64).ln() * 5.0).min(25.0)
+        ((vectors as f64).ln() * 2.0).min(10.0)
     } else {
         0.0
     };
-    // Cluster formation: clusters mean the system has found structure
-    let cluster_score = (clusters as f64 * 5.0).min(15.0);
-    // Routing: learned routing weights indicate experience
-    let route_score = (routes as f64 * 3.0).min(20.0);
+    let cluster_score = (clusters as f64 * 2.5).min(5.0);
+    let volume = pattern_score + vector_score + cluster_score;
 
-    let total = pattern_score + vector_score + cluster_score + route_score;
+    // Outcome (70%): trajectory success (30) + routing accuracy (20) + promotion (10) + routes (10)
+    let outcome = if let Some(db) = db {
+        let m = get_outcome_metrics(db);
+        let traj_score = m.trajectory_success_rate * 30.0;
+        let routing_score = if m.routing_total > 2 {
+            m.routing_accuracy * 20.0
+        } else {
+            0.0
+        };
+        let promo_score = m.promotion_rate * 10.0;
+        let route_score = (m.route_count as f64 * 2.0).min(10.0);
+        traj_score + routing_score + promo_score + route_score
+    } else {
+        0.0
+    };
+
+    let total = volume + outcome;
     (total.min(100.0)) as u32
 }
 

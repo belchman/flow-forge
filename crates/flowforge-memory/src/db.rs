@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use flowforge_core::{
     trajectory::{StepOutcome, Trajectory, TrajectoryStatus, TrajectoryStep, TrajectoryVerdict},
-    types::{GateAction, GateDecision, RiskLevel, TrustScore},
+    types::{ContextInjection, GateAction, GateDecision, RiskLevel, TrustScore},
     work_tracking::WorkDb,
     AgentSession, AgentSessionStatus, Checkpoint, ConversationMessage, EditRecord, Error,
     LongTermPattern, MailboxMessage, Result, RoutingWeight, SessionFork, SessionInfo,
@@ -300,6 +300,18 @@ impl MemoryDb {
                 created_at TEXT NOT NULL,
                 last_recomputed TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS context_injections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                trajectory_id TEXT,
+                injection_type TEXT NOT NULL,
+                reference_id TEXT,
+                similarity REAL,
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ctx_inject_session ON context_injections(session_id);
+            CREATE INDEX IF NOT EXISTS idx_ctx_inject_trajectory ON context_injections(trajectory_id);
         ",
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
@@ -331,6 +343,9 @@ impl MemoryDb {
         let _ = self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_hnsw_entries_cluster ON hnsw_entries(cluster_id);",
         );
+
+        // Effectiveness tracking migration
+        self.migrate_add_column("context_injections", "effectiveness", "TEXT")?;
 
         Ok(())
     }
@@ -1402,6 +1417,17 @@ impl MemoryDb {
             .execute(
                 "UPDATE work_items SET backend = ?1, updated_at = ?2 WHERE id = ?3",
                 params![backend, now, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn update_work_item_external_id(&self, id: &str, external_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE work_items SET external_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![external_id, now, id],
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
         Ok(())
@@ -2705,6 +2731,197 @@ impl MemoryDb {
             .map_err(|e| Error::Sqlite(e.to_string()))
     }
 
+    // ── Context Injections (Impact Tracking) ──
+
+    pub fn record_context_injection(
+        &self,
+        session_id: &str,
+        trajectory_id: Option<&str>,
+        injection_type: &str,
+        reference_id: Option<&str>,
+        similarity: Option<f64>,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO context_injections (session_id, trajectory_id, injection_type, reference_id, similarity, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![session_id, trajectory_id, injection_type, reference_id, similarity, now],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_injections_for_session(&self, session_id: &str) -> Result<Vec<ContextInjection>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, trajectory_id, injection_type, reference_id, similarity, timestamp
+                 FROM context_injections WHERE session_id = ?1 ORDER BY id ASC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok(ContextInjection {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    trajectory_id: row.get(2)?,
+                    injection_type: row.get(3)?,
+                    reference_id: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    similarity: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    /// Set effectiveness rating on a context injection.
+    pub fn rate_context_injection(&self, id: i64, rating: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE context_injections SET effectiveness = ?1 WHERE id = ?2",
+                params![rating, id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Rate all injections in a session based on trajectory verdict.
+    pub fn rate_session_injections(&self, session_id: &str, rating: &str) -> Result<usize> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE context_injections SET effectiveness = ?1 WHERE session_id = ?2 AND effectiveness IS NULL",
+                params![rating, session_id],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(updated)
+    }
+
+    /// Aggregate effectiveness stats per injection type.
+    pub fn get_injection_effectiveness_stats(
+        &self,
+        injection_type: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT COALESCE(effectiveness, 'unrated'), COUNT(*)
+                 FROM context_injections
+                 WHERE injection_type = ?1
+                 GROUP BY effectiveness
+                 ORDER BY COUNT(*) DESC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![injection_type], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    /// Count routing accuracy: how often the suggested agent matches the trajectory agent.
+    /// Looks at routing_hit:* meta keys (set by session_end hook).
+    pub fn routing_accuracy_stats(&self) -> Result<(u64, u64)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM flowforge_meta WHERE key LIKE 'routing_hit:%'")
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let mut hits = 0u64;
+        let mut total = 0u64;
+        for val in rows.flatten() {
+            total += 1;
+            if val == "1" {
+                hits += 1;
+            }
+        }
+        Ok((hits, total))
+    }
+
+    /// Average trajectory confidence for sessions with vs without context injections.
+    pub fn context_effectiveness_stats(&self) -> Result<(f64, f64, u64, u64)> {
+        // Sessions WITH injections
+        let (with_conf, with_count): (f64, u64) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(AVG(t.confidence), 0.0), COUNT(*)
+                 FROM trajectories t
+                 WHERE t.status = 'judged' AND t.confidence IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM context_injections ci WHERE ci.session_id = t.session_id)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+
+        // Sessions WITHOUT injections
+        let (without_conf, without_count): (f64, u64) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(AVG(t.confidence), 0.0), COUNT(*)
+                 FROM trajectories t
+                 WHERE t.status = 'judged' AND t.confidence IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM context_injections ci WHERE ci.session_id = t.session_id)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+
+        Ok((with_conf, without_conf, with_count, without_count))
+    }
+
+    /// Pattern hit rate: sessions with pattern injections where trajectory verdict = success.
+    pub fn pattern_hit_rate(&self) -> Result<(u64, u64)> {
+        let total: u64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT ci.session_id)
+                 FROM context_injections ci
+                 JOIN trajectories t ON t.session_id = ci.session_id
+                 WHERE ci.injection_type = 'pattern' AND t.status = 'judged'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+
+        let successes: u64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT ci.session_id)
+                 FROM context_injections ci
+                 JOIN trajectories t ON t.session_id = ci.session_id
+                 WHERE ci.injection_type = 'pattern' AND t.status = 'judged' AND t.verdict = 'success'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+
+        Ok((successes, total))
+    }
+
+    /// Success rate of the last N judged trajectories.
+    pub fn recent_trajectory_success_rate(&self, limit: usize) -> Result<f64> {
+        let (total, successes): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*), SUM(CASE WHEN verdict = 'success' THEN 1 ELSE 0 END)
+                 FROM (SELECT verdict FROM trajectories WHERE status = 'judged' ORDER BY ended_at DESC LIMIT ?1)",
+                params![limit],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        if total == 0 {
+            return Ok(0.0);
+        }
+        Ok(successes as f64 / total as f64)
+    }
+
     /// Update cluster stats (member_count, p95, avg_confidence).
     pub fn update_cluster_stats(
         &self,
@@ -2742,6 +2959,9 @@ impl WorkDb for MemoryDb {
     }
     fn update_work_item_backend(&self, id: &str, backend: &str) -> Result<()> {
         self.update_work_item_backend(id, backend)
+    }
+    fn update_work_item_external_id(&self, id: &str, external_id: &str) -> Result<()> {
+        self.update_work_item_external_id(id, external_id)
     }
     fn list_work_items(&self, filter: &WorkFilter) -> Result<Vec<WorkItem>> {
         self.list_work_items(filter)

@@ -121,6 +121,51 @@ pub fn stats() -> Result<()> {
         println!("  Outlier vectors: {}", outlier_count);
     }
 
+    // Context Effectiveness
+    let (routing_hits, routing_total) = db.routing_accuracy_stats().unwrap_or((0, 0));
+    let (pattern_successes, pattern_total) = db.pattern_hit_rate().unwrap_or((0, 0));
+    let (with_conf, without_conf, with_count, without_count) =
+        db.context_effectiveness_stats().unwrap_or((0.0, 0.0, 0, 0));
+
+    if routing_total > 0 || pattern_total > 0 || with_count > 0 {
+        println!();
+        println!("{}", "Context Effectiveness:".bold());
+        if routing_total > 0 {
+            println!(
+                "  Routing accuracy: {}/{} ({:.0}%)",
+                routing_hits,
+                routing_total,
+                if routing_total > 0 {
+                    routing_hits as f64 / routing_total as f64 * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
+        if pattern_total > 0 {
+            println!(
+                "  Pattern hit rate: {}/{} ({:.0}%)",
+                pattern_successes,
+                pattern_total,
+                if pattern_total > 0 {
+                    pattern_successes as f64 / pattern_total as f64 * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
+        if with_count > 0 || without_count > 0 {
+            println!(
+                "  Avg confidence: with ctx={:.2} (n={}) vs without={:.2} (n={})",
+                with_conf, with_count, without_conf, without_count
+            );
+            if with_count > 5 && without_count > 5 {
+                let lift = with_conf - without_conf;
+                println!("  Context lift: {:+.2}", lift);
+            }
+        }
+    }
+
     println!();
     println!(
         "Embedder: {}",
@@ -251,6 +296,79 @@ pub fn clusters() -> Result<()> {
         );
     }
     println!("  Outliers: {} unclustered patterns", outlier_count);
+
+    Ok(())
+}
+
+pub fn tune_clusters() -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = MemoryDb::open(&config.db_path())?;
+
+    use flowforge_memory::clustering::ClusterManager;
+    let mgr = ClusterManager::new(&db, &config.patterns);
+    let result = mgr.tune()?;
+
+    if result.vector_count == 0 {
+        println!("No pattern vectors found. Store some patterns first.");
+        return Ok(());
+    }
+
+    println!("{}", "DBSCAN Parameter Tuning".bold());
+    println!();
+    println!("  Vectors analyzed: {}", result.vector_count);
+    println!(
+        "  Current epsilon:    {:.3} (cosine distance)",
+        config.patterns.clustering_epsilon
+    );
+    println!(
+        "  Suggested epsilon:  {:.3} (cosine distance)",
+        result.suggested_epsilon
+    );
+    println!(
+        "  Current min_points: {}",
+        config.patterns.clustering_min_points
+    );
+    println!("  Suggested min_points: {}", result.suggested_min_points);
+    println!("  Elbow index: {}", result.elbow_index);
+
+    if !result.k_distances.is_empty() {
+        println!();
+        println!("{}", "K-distance distribution:".bold());
+        let top_n = 10.min(result.k_distances.len());
+        println!("  Top {} (largest distances):", top_n);
+        for (i, d) in result.k_distances.iter().take(top_n).enumerate() {
+            let marker = if i == result.elbow_index {
+                " <-- elbow"
+            } else {
+                ""
+            };
+            println!("    [{:3}] {:.4}{}", i, d, marker);
+        }
+        let bottom_start = result.k_distances.len().saturating_sub(10);
+        if bottom_start > top_n {
+            println!("  ...");
+            println!("  Bottom 10 (smallest distances):");
+            for (i, d) in result.k_distances.iter().enumerate().skip(bottom_start) {
+                let marker = if i == result.elbow_index {
+                    " <-- elbow"
+                } else {
+                    ""
+                };
+                println!("    [{:3}] {:.4}{}", i, d, marker);
+            }
+        }
+    }
+
+    println!();
+    println!("{}", "To apply, add to .flowforge/config.toml:".dimmed());
+    println!(
+        "{}",
+        format!(
+            "[patterns]\nclustering_epsilon = {:.3}\nclustering_min_points = {}",
+            result.suggested_epsilon, result.suggested_min_points
+        )
+        .dimmed()
+    );
 
     Ok(())
 }

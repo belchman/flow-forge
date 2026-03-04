@@ -262,6 +262,8 @@ enum LearnAction {
     DownloadModel,
     /// Show topic clusters
     Clusters,
+    /// Auto-tune DBSCAN clustering parameters
+    TuneClusters,
 }
 
 #[derive(Subcommand)]
@@ -566,6 +568,7 @@ fn main() {
             LearnAction::Judge { id } => commands::learn::judge(&id),
             LearnAction::DownloadModel => commands::learn::download_model(),
             LearnAction::Clusters => commands::learn::clusters(),
+            LearnAction::TuneClusters => commands::learn::tune_clusters(),
         },
         Commands::Agent { action } => match action {
             AgentAction::List => commands::agent::list(),

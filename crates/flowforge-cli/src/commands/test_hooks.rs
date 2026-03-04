@@ -272,7 +272,7 @@ fn run_hook_test(test: &HookTest, binary: &str, verbose: bool) -> TestResult {
     {
         errors.push(format!(
             "Stdout is not valid JSON: {}",
-            &stdout.trim()[..stdout.trim().len().min(200)]
+            stdout.trim().chars().take(200).collect::<String>()
         ));
     }
 

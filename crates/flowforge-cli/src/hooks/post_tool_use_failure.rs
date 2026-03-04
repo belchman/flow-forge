@@ -14,11 +14,8 @@ pub fn run() -> Result<()> {
         if db_path.exists() {
             if let Ok(db) = MemoryDb::open(&db_path) {
                 let error_msg = input.error.as_deref().unwrap_or("unknown error");
-                let pattern = format!(
-                    "tool_failure:{} - {}",
-                    input.tool_name,
-                    &error_msg[..error_msg.len().min(100)]
-                );
+                let truncated: String = error_msg.chars().take(100).collect();
+                let pattern = format!("tool_failure:{} - {}", input.tool_name, truncated);
                 let store = flowforge_memory::PatternStore::new(&db, &config.patterns);
                 let _ = store.store_short_term(&pattern, "error_pattern");
             }

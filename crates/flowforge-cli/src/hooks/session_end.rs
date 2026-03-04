@@ -71,6 +71,41 @@ pub fn run() -> Result<()> {
                     let _ = judge.distill(&trajectory.id);
                 }
 
+                // Effectiveness feedback: routing accuracy + pattern confidence boost
+                if let Ok(injections) = db.get_injections_for_session(&session.id) {
+                    // Routing accuracy: compare suggested agent vs actual
+                    for inj in injections.iter().filter(|i| i.injection_type == "routing") {
+                        let hit = trajectory
+                            .agent_name
+                            .as_ref()
+                            .map(|a| a.eq_ignore_ascii_case(&inj.reference_id))
+                            .unwrap_or(false);
+                        let _ = db.set_meta(
+                            &format!("routing_hit:{}", session.id),
+                            if hit { "1" } else { "0" },
+                        );
+                    }
+
+                    // Pattern confidence boost on success
+                    if result.verdict == flowforge_core::trajectory::TrajectoryVerdict::Success {
+                        let store = flowforge_memory::PatternStore::new(&db, &config.patterns);
+                        for inj in injections.iter().filter(|i| i.injection_type == "pattern") {
+                            let _ = store.record_feedback(&inj.reference_id, true);
+                        }
+                    }
+                }
+
+                // Auto-rate all context injections based on trajectory verdict
+                {
+                    use flowforge_core::trajectory::TrajectoryVerdict;
+                    let rating = match result.verdict {
+                        TrajectoryVerdict::Success => "correlated_success",
+                        TrajectoryVerdict::Failure => "correlated_failure",
+                        TrajectoryVerdict::Partial => "correlated_partial",
+                    };
+                    let _ = db.rate_session_injections(&session.id, rating);
+                }
+
                 // Feed verdict back to routing weights (close the learning loop)
                 if let (Some(ref agent_name), Some(ref task_desc)) =
                     (&trajectory.agent_name, &trajectory.task_description)

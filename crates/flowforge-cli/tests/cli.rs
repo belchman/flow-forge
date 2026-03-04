@@ -193,9 +193,9 @@ fn test_statusline_legend() {
         .success()
         .stdout(predicate::str::contains("Dashboard Legend"))
         .stdout(predicate::str::contains("HEADER LINE"))
-        .stdout(predicate::str::contains("LEARNING LINE"))
+        .stdout(predicate::str::contains("LEARN LINE"))
         .stdout(predicate::str::contains("SWARM LINE"))
-        .stdout(predicate::str::contains("ARCHITECTURE LINE"));
+        .stdout(predicate::str::contains("DEBUG LINE"));
 }
 
 // ── Session subcommands ──

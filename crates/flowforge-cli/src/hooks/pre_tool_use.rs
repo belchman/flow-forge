@@ -28,6 +28,14 @@ pub fn run() -> Result<()> {
 
     let db = MemoryDb::open(&db_path)?;
 
+    // Resolve session_id once and reuse everywhere
+    let session_id = db
+        .get_current_session()
+        .ok()
+        .flatten()
+        .map(|s| s.id)
+        .unwrap_or_else(|| "unknown".to_string());
+
     // 1. Guidance gates (if enabled)
     if config.guidance.enabled {
         let engine = match flowforge_core::guidance::GuidanceEngine::from_config(&config.guidance) {
@@ -39,12 +47,7 @@ pub fn run() -> Result<()> {
         };
 
         // Get or create trust score for current session
-        let session_id = db
-            .get_current_session()
-            .ok()
-            .flatten()
-            .map(|s| s.id)
-            .unwrap_or_else(|| "unknown".to_string());
+        let session_id = session_id.clone();
 
         let trust = db
             .get_trust_score(&session_id)
@@ -141,9 +144,7 @@ pub fn run() -> Result<()> {
 
     // 3. Work-stealing heartbeat (piggyback on every tool use)
     if config.work_tracking.work_stealing.enabled {
-        if let Ok(Some(session)) = db.get_current_session() {
-            let _ = db.update_heartbeat(&session.id);
-        }
+        let _ = db.update_heartbeat(&session_id);
     }
 
     // 4. Existing: dangerous command check for Bash
@@ -160,9 +161,7 @@ pub fn run() -> Result<()> {
     }
 
     // 5. Existing: increment command count
-    if let Ok(Some(session)) = db.get_current_session() {
-        let _ = db.increment_session_commands(&session.id);
-    }
+    let _ = db.increment_session_commands(&session_id);
 
     Ok(())
 }

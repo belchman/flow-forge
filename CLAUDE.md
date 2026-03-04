@@ -74,6 +74,12 @@ FlowForge uses BOTH a fast Rust-based memory system AND Claude's native auto-mem
 - Use `flowforge learn judge <id>` to manually judge a trajectory
 - MCP tools: `trajectory_list`, `trajectory_get`, `trajectory_judge`
 
+### Performance Tuning
+- Set `FLOWFORGE_HOOKS_DISABLED=1` to disable all hooks except work-tracking enforcement (for A/B benchmarking)
+- Config `[hooks] inject_agent_body = false` (default): injects 1-line agent summary instead of full markdown body (~460 tokens saved per prompt)
+- Config `[patterns] min_injection_similarity = 0.55` (default): filters low-quality pattern matches before injection
+- Context injections are auto-rated at session end (`correlated_success`/`correlated_failure`) for effectiveness tracking
+
 ### Building & Installing
 - After any code change, rebuild and reinstall: `cargo build --release && rm -f ~/.cargo/bin/flowforge && cp target/release/flowforge ~/.cargo/bin/flowforge`
 - **Important:** Always `rm` the old binary before copying. macOS caches in-place overwrites, causing the stale binary to hang indefinitely. All hooks will silently fail/timeout if this happens.

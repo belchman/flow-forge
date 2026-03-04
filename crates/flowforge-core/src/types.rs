@@ -538,6 +538,18 @@ pub struct MailboxMessage {
     pub metadata: Option<String>,
 }
 
+/// Context injection record for impact tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextInjection {
+    pub id: i64,
+    pub session_id: String,
+    pub trajectory_id: Option<String>,
+    pub injection_type: String,
+    pub reference_id: String,
+    pub similarity: Option<f64>,
+    pub timestamp: String,
+}
+
 /// Tmux display state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TmuxState {

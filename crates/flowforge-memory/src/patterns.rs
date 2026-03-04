@@ -564,7 +564,7 @@ impl<'a> PatternStore<'a> {
         Ok(())
     }
 
-    /// Re-cluster if never run or if outlier count exceeds threshold.
+    /// Re-cluster if never run, if outlier count exceeds threshold, or if epsilon changed.
     fn maybe_recluster(&self) -> Result<()> {
         let last_run = self.db.get_meta("last_cluster_run")?;
         let outlier_count = self
@@ -574,12 +574,26 @@ impl<'a> PatternStore<'a> {
             .parse::<usize>()
             .unwrap_or(0);
 
-        let should_recluster =
-            last_run.is_none() || outlier_count >= self.config.outlier_recluster_threshold;
+        // Detect epsilon change: recluster when stored epsilon doesn't match config
+        let stored_epsilon = self
+            .db
+            .get_meta("clustering_epsilon")?
+            .and_then(|s| s.parse::<f64>().ok());
+        let epsilon_changed = stored_epsilon
+            .map(|e| (e - self.config.clustering_epsilon).abs() > 0.001)
+            .unwrap_or(last_run.is_some()); // only force on first config write if clusters exist
+
+        let should_recluster = last_run.is_none()
+            || outlier_count >= self.config.outlier_recluster_threshold
+            || epsilon_changed;
 
         if should_recluster {
             let mgr = crate::clustering::ClusterManager::new(self.db, self.config);
             mgr.recluster()?;
+            self.db.set_meta(
+                "clustering_epsilon",
+                &self.config.clustering_epsilon.to_string(),
+            )?;
         }
         Ok(())
     }

@@ -9,53 +9,44 @@ pub fn run() -> Result<()> {
     let v = hook::parse_stdin_value()?;
     let input = PostToolUseInput::from_value(&v)?;
 
-    // Record edits for Write, Edit, MultiEdit operations
-    match input.tool_name.as_str() {
-        "Write" | "Edit" | "MultiEdit" => {
-            record_edit(&input)?;
-        }
-        _ => {}
-    }
-
-    // Record trajectory step (if trajectory is active)
+    // Single config load + DB open for the entire hook
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
     let db_path = config.db_path();
-    if db_path.exists() {
-        if let Ok(db) = MemoryDb::open(&db_path) {
-            if let Ok(Some(session)) = db.get_current_session() {
-                if let Ok(Some(trajectory)) = db.get_active_trajectory(&session.id) {
-                    // Hash tool_input for privacy
-                    let input_str = serde_json::to_string(&input.tool_input).unwrap_or_default();
-                    let input_hash = format!("{:x}", Sha256::digest(input_str.as_bytes()));
-                    let _ = db.record_trajectory_step(
-                        &trajectory.id,
-                        &input.tool_name,
-                        Some(&input_hash),
-                        flowforge_core::trajectory::StepOutcome::Success,
-                        None,
-                    );
-                }
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let db = MemoryDb::open(&db_path)?;
+
+    // Record edits for Write, Edit, MultiEdit operations (reuse config + db)
+    if config.hooks.edit_tracking {
+        match input.tool_name.as_str() {
+            "Write" | "Edit" | "MultiEdit" => {
+                record_edit(&input, &db)?;
             }
+            _ => {}
+        }
+    }
+
+    // Record trajectory step (reuse db)
+    if let Ok(Some(session)) = db.get_current_session() {
+        if let Ok(Some(trajectory)) = db.get_active_trajectory(&session.id) {
+            // Hash tool_input for privacy
+            let input_str = serde_json::to_string(&input.tool_input).unwrap_or_default();
+            let input_hash = format!("{:x}", Sha256::digest(input_str.as_bytes()));
+            let _ = db.record_trajectory_step(
+                &trajectory.id,
+                &input.tool_name,
+                Some(&input_hash),
+                flowforge_core::trajectory::StepOutcome::Success,
+                None,
+            );
         }
     }
 
     Ok(())
 }
 
-fn record_edit(input: &PostToolUseInput) -> Result<()> {
-    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
-
-    if !config.hooks.edit_tracking {
-        return Ok(());
-    }
-
-    let db_path = config.db_path();
-    if !db_path.exists() {
-        return Ok(());
-    }
-
-    let db = MemoryDb::open(&db_path)?;
-
+fn record_edit(input: &PostToolUseInput, db: &MemoryDb) -> Result<()> {
     let file_path = input
         .tool_input
         .get("file_path")

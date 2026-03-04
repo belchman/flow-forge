@@ -8,7 +8,7 @@ After any change, always run:
 
 ```bash
 cargo build --workspace              # Must compile with 0 warnings
-cargo test --workspace               # All 120+ tests must pass
+cargo test --workspace               # All 164+ tests must pass
 cargo clippy --workspace -- -D warnings  # Must be clean
 cargo fmt --all --check              # Must be formatted
 ```

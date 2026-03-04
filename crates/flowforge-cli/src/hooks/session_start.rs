@@ -53,6 +53,14 @@ pub fn run() -> Result<()> {
                 // Initialize trust score
                 let _ = db.create_trust_score(session_id, config.guidance.trust_initial_score);
 
+                // Sync work items from external backend and write to Claude Tasks
+                let _ =
+                    flowforge_core::work_tracking::sync_from_backend(&db, &config.work_tracking);
+                let _ = flowforge_core::work_tracking::sync_all_to_claude_tasks(
+                    &db,
+                    &config.work_tracking,
+                );
+
                 // Log session start event
                 if config.work_tracking.log_all {
                     let event = flowforge_core::WorkEvent {

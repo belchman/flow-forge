@@ -994,11 +994,36 @@ impl ToolRegistry {
             Ok(db) => {
                 let short = db.count_patterns_short().unwrap_or(0);
                 let long = db.count_patterns_long().unwrap_or(0);
+
+                // Context effectiveness metrics
+                let (routing_hits, routing_total) = db.routing_accuracy_stats().unwrap_or((0, 0));
+                let (pattern_successes, pattern_total) = db.pattern_hit_rate().unwrap_or((0, 0));
+                let (with_conf, without_conf, with_count, without_count) =
+                    db.context_effectiveness_stats().unwrap_or((0.0, 0.0, 0, 0));
+
                 json!({
                     "status": "ok",
                     "short_term_count": short,
                     "long_term_count": long,
                     "total": short + long,
+                    "context_effectiveness": {
+                        "routing_accuracy": {
+                            "hits": routing_hits,
+                            "total": routing_total,
+                            "rate": if routing_total > 0 { routing_hits as f64 / routing_total as f64 } else { 0.0 },
+                        },
+                        "pattern_hit_rate": {
+                            "successes": pattern_successes,
+                            "total": pattern_total,
+                            "rate": if pattern_total > 0 { pattern_successes as f64 / pattern_total as f64 } else { 0.0 },
+                        },
+                        "avg_confidence": {
+                            "with_context": with_conf,
+                            "without_context": without_conf,
+                            "with_count": with_count,
+                            "without_count": without_count,
+                        },
+                    },
                 })
             }
             Err(e) => {

@@ -20,6 +20,12 @@ pub fn run_safe(
     hook_name: &str,
     f: impl FnOnce() -> flowforge_core::Result<()>,
 ) -> flowforge_core::Result<()> {
+    // Kill-switch: skip all hooks for A/B benchmarking.
+    // user_prompt_submit is exempt so work-tracking enforcement always fires.
+    if std::env::var("FLOWFORGE_HOOKS_DISABLED").is_ok() && hook_name != "user-prompt-submit" {
+        return Ok(());
+    }
+
     let succeeded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {

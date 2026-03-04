@@ -8,6 +8,12 @@ pub fn run() -> Result<()> {
     let v = hook::parse_stdin_value()?;
     let input = UserPromptSubmitInput::from_value(&v)?;
 
+    // Kill-switch fast-path: skip routing/patterns/embeddings but still
+    // enforce work-tracking so tasks are never silently forgotten.
+    if std::env::var("FLOWFORGE_HOOKS_DISABLED").is_ok() {
+        return run_work_tracking_only();
+    }
+
     let prompt = match input.prompt {
         Some(ref p) if p.trim().len() >= 5 => p.clone(),
         _ => {
@@ -32,14 +38,31 @@ pub fn run() -> Result<()> {
         None
     };
 
+    // Resolve session_id and trajectory_id once for injection recording
+    let (current_session_id, current_trajectory_id) = if let Some(ref db) = db {
+        let sid = db
+            .get_current_session()
+            .ok()
+            .flatten()
+            .map(|s| s.id.clone());
+        let tid = sid.as_ref().and_then(|s| {
+            db.get_active_trajectory(s)
+                .ok()
+                .flatten()
+                .map(|t| t.id.clone())
+        });
+        (sid, tid)
+    } else {
+        (None, None)
+    };
+
     // Set trajectory task description from first user prompt
     if let Some(ref db) = db {
-        if let Ok(Some(session)) = db.get_current_session() {
-            if let Ok(Some(trajectory)) = db.get_active_trajectory(&session.id) {
+        if let (Some(ref sid), Some(ref tid)) = (&current_session_id, &current_trajectory_id) {
+            if let Ok(Some(trajectory)) = db.get_active_trajectory(sid) {
                 if trajectory.task_description.is_none() {
-                    // Use first ~200 chars of prompt as task description
                     let desc: String = prompt.chars().take(200).collect();
-                    let _ = db.set_trajectory_task_description(&trajectory.id, &desc);
+                    let _ = db.set_trajectory_task_description(tid, &desc);
                 }
             }
         }
@@ -102,10 +125,22 @@ pub fn run() -> Result<()> {
                             breakdown_line,
                         );
 
-                        // Include agent body for top match
+                        // Include agent context for top match
                         if let Some(agent) = registry.get(&top.agent_name) {
-                            if !agent.body.is_empty() {
-                                routing_ctx.push_str(&format!("\n\n{}", agent.body));
+                            if config.hooks.inject_agent_body {
+                                // Legacy: inject full markdown body
+                                if !agent.body.is_empty() {
+                                    routing_ctx.push_str(&format!("\n\n{}", agent.body));
+                                }
+                            } else {
+                                // Default: compact 1-line summary
+                                routing_ctx.push_str(&format!("\nRole: {}", agent.description));
+                                if !agent.capabilities.is_empty() {
+                                    routing_ctx.push_str(&format!(
+                                        "\nCapabilities: {}",
+                                        agent.capabilities.join(", ")
+                                    ));
+                                }
                             }
                         }
 
@@ -119,6 +154,19 @@ pub fn run() -> Result<()> {
                         }
 
                         context_parts.push(routing_ctx);
+
+                        // Record routing injection
+                        if let Some(ref db) = db {
+                            if let Some(ref sid) = current_session_id {
+                                let _ = db.record_context_injection(
+                                    sid,
+                                    current_trajectory_id.as_deref(),
+                                    "routing",
+                                    Some(&top.agent_name),
+                                    Some(top.confidence),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -143,6 +191,19 @@ pub fn run() -> Result<()> {
                     ));
                 }
                 context_parts.push(work_ctx);
+
+                // Record work item injections
+                if let Some(ref sid) = current_session_id {
+                    for item in active_items.iter().take(5) {
+                        let _ = db.record_context_injection(
+                            sid,
+                            current_trajectory_id.as_deref(),
+                            "work_item",
+                            Some(&item.id),
+                            None,
+                        );
+                    }
+                }
             } else if config.work_tracking.require_task {
                 context_parts.push(
                     "[FlowForge Work] No active work item. Create one with `flowforge work create` or use your task tracker.".to_string()
@@ -167,6 +228,20 @@ pub fn run() -> Result<()> {
                         ));
                     }
                     context_parts.push(ctx);
+
+                    // Record mailbox injections
+                    if let Some(ref session_id) = current_session_id {
+                        for msg in &unread {
+                            let _ = db.record_context_injection(
+                                session_id,
+                                current_trajectory_id.as_deref(),
+                                "mailbox",
+                                Some(&msg.from_agent_name),
+                                None,
+                            );
+                        }
+                    }
+
                     let _ = db.mark_messages_read(sid);
                 }
             }
@@ -178,6 +253,13 @@ pub fn run() -> Result<()> {
         if let Some(ref db) = db {
             let store = PatternStore::new(db, &config.patterns);
             if let Ok(matches) = store.search_all_patterns(&prompt, 5) {
+                // Filter out low-similarity noise
+                let sim_floor = config.patterns.min_injection_similarity;
+                let matches: Vec<_> = matches
+                    .into_iter()
+                    .filter(|m| m.similarity as f64 >= sim_floor)
+                    .collect();
+
                 let proven: Vec<_> = matches
                     .iter()
                     .filter(|m| m.tier == PatternTier::Long && m.confidence > 0.5)
@@ -214,21 +296,46 @@ pub fn run() -> Result<()> {
                     context_parts.push(ctx);
                 }
 
-                // Record usage on all injected patterns so they accumulate
-                // toward the promotion threshold (3x usage, 60% confidence)
+                // Record usage and injection on all injected patterns
                 for m in proven.iter().chain(recent.iter()) {
                     let _ = store.record_usage(&m.id);
+
+                    // Record pattern injection for impact tracking
+                    if let Some(ref sid) = current_session_id {
+                        let _ = db.record_context_injection(
+                            sid,
+                            current_trajectory_id.as_deref(),
+                            "pattern",
+                            Some(&m.id),
+                            Some(m.similarity as f64),
+                        );
+                    }
                 }
             }
 
-            // Search key-value memory for relevant stored knowledge
-            if let Ok(kv_results) = db.kv_search(&prompt, 3) {
-                if !kv_results.is_empty() {
-                    let mut kv_ctx = String::from("[FlowForge Memory] Stored knowledge:");
-                    for (key, value, _ns) in &kv_results {
-                        kv_ctx.push_str(&format!("\n- {}: {}", key, value));
+            // Search key-value memory for relevant stored knowledge (skip short prompts)
+            if prompt.len() >= 10 {
+                if let Ok(kv_results) = db.kv_search(&prompt, 3) {
+                    if !kv_results.is_empty() {
+                        let mut kv_ctx = String::from("[FlowForge Memory] Stored knowledge:");
+                        for (key, value, _ns) in &kv_results {
+                            kv_ctx.push_str(&format!("\n- {}: {}", key, value));
+                        }
+                        context_parts.push(kv_ctx);
+
+                        // Record KV injections
+                        if let Some(ref sid) = current_session_id {
+                            for (key, _, _) in &kv_results {
+                                let _ = db.record_context_injection(
+                                    sid,
+                                    current_trajectory_id.as_deref(),
+                                    "kv",
+                                    Some(key),
+                                    None,
+                                );
+                            }
+                        }
                     }
-                    context_parts.push(kv_ctx);
                 }
             }
         }
@@ -336,4 +443,63 @@ fn load_learned_weights_from_db(db: &MemoryDb, prompt: &str) -> HashMap<(String,
     }
 
     weights
+}
+
+/// Lightweight fast-path: only check for active work items.
+/// Runs when FLOWFORGE_HOOKS_DISABLED is set so work-tracking enforcement
+/// is never bypassed. Skips routing, patterns, embeddings (~1.2s saved).
+fn run_work_tracking_only() -> Result<()> {
+    let config = match FlowForgeConfig::load(&FlowForgeConfig::config_path()) {
+        Ok(c) => c,
+        Err(_) => {
+            ContextOutput::none().write()?;
+            return Ok(());
+        }
+    };
+
+    if !config.work_tracking.require_task {
+        ContextOutput::none().write()?;
+        return Ok(());
+    }
+
+    let db_path = config.db_path();
+    if !db_path.exists() {
+        ContextOutput::none().write()?;
+        return Ok(());
+    }
+
+    let db = match MemoryDb::open(&db_path) {
+        Ok(db) => db,
+        Err(_) => {
+            ContextOutput::none().write()?;
+            return Ok(());
+        }
+    };
+
+    let filter = flowforge_core::WorkFilter {
+        status: Some("in_progress".to_string()),
+        ..Default::default()
+    };
+
+    match db.list_work_items(&filter) {
+        Ok(items) if !items.is_empty() => {
+            let mut ctx = String::from("[FlowForge Work] Active items:");
+            for item in items.iter().take(5) {
+                ctx.push_str(&format!(
+                    "\n- {} ({}): {}",
+                    item.id.chars().take(8).collect::<String>(),
+                    item.status,
+                    item.title,
+                ));
+            }
+            ContextOutput::with_context(ctx).write()?;
+        }
+        _ => {
+            ContextOutput::with_context(
+                "[FlowForge Work] No active work item. Create one with `flowforge work create` or use your task tracker.".to_string()
+            ).write()?;
+        }
+    }
+
+    Ok(())
 }

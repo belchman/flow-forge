@@ -15,6 +15,15 @@ pub struct ClusterResult {
     pub outlier_count: usize,
 }
 
+/// Result of auto-tuning DBSCAN parameters via k-distance elbow detection.
+pub struct TuneResult {
+    pub suggested_epsilon: f64,
+    pub suggested_min_points: usize,
+    pub vector_count: usize,
+    pub k_distances: Vec<f64>,
+    pub elbow_index: usize,
+}
+
 /// Result of finding a cluster for a query vector.
 pub struct ClusterMatch {
     pub cluster_id: i64,
@@ -186,6 +195,59 @@ impl<'a> ClusterManager<'a> {
         Ok(best)
     }
 
+    /// Auto-tune DBSCAN parameters via k-distance elbow detection.
+    /// Computes k-th nearest neighbor distance for each vector (k = min_points),
+    /// sorts descending, and finds the elbow via max second derivative.
+    pub fn tune(&self) -> Result<TuneResult> {
+        let vectors = self.db.get_all_pattern_vectors()?;
+        let n = vectors.len();
+        let k = self.config.clustering_min_points;
+
+        if n < k + 1 {
+            return Ok(TuneResult {
+                suggested_epsilon: self.config.clustering_epsilon,
+                suggested_min_points: k,
+                vector_count: n,
+                k_distances: Vec::new(),
+                elbow_index: 0,
+            });
+        }
+
+        // Compute pairwise cosine distances and find k-th nearest neighbor distance
+        let mut k_distances: Vec<f64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut dists: Vec<f64> = Vec::with_capacity(n - 1);
+            for j in 0..n {
+                if i != j {
+                    let sim = cosine_similarity(&vectors[i].1, &vectors[j].1);
+                    dists.push((1.0 - sim) as f64);
+                }
+            }
+            dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // k-th nearest (0-indexed, so index k-1)
+            if let Some(&d) = dists.get(k - 1) {
+                k_distances.push(d);
+            }
+        }
+
+        // Sort descending for elbow detection
+        k_distances.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+        let elbow_index = find_elbow(&k_distances);
+        let suggested_epsilon = k_distances
+            .get(elbow_index)
+            .copied()
+            .unwrap_or(self.config.clustering_epsilon);
+
+        Ok(TuneResult {
+            suggested_epsilon,
+            suggested_min_points: k,
+            vector_count: n,
+            k_distances,
+            elbow_index,
+        })
+    }
+
     /// Record an outlier. Returns true if outlier count exceeds recluster threshold.
     pub fn record_outlier(&self) -> Result<bool> {
         let current = self
@@ -199,6 +261,24 @@ impl<'a> ClusterManager<'a> {
             .set_meta("outlier_count_since_cluster", &new_count.to_string())?;
         Ok(new_count >= self.config.outlier_recluster_threshold)
     }
+}
+
+/// Find the elbow point in a sorted (descending) k-distance curve.
+/// Uses max second derivative (discrete approximation).
+fn find_elbow(distances: &[f64]) -> usize {
+    if distances.len() < 3 {
+        return 0;
+    }
+    let mut max_second_deriv = 0.0f64;
+    let mut elbow = 0;
+    for i in 1..distances.len() - 1 {
+        let second_deriv = (distances[i - 1] - 2.0 * distances[i] + distances[i + 1]).abs();
+        if second_deriv > max_second_deriv {
+            max_second_deriv = second_deriv;
+            elbow = i;
+        }
+    }
+    elbow
 }
 
 #[cfg(test)]

@@ -149,6 +149,9 @@ pub struct PatternsConfig {
     pub cluster_decay_active_factor: f64,
     #[serde(default = "default_cluster_decay_isolated_factor")]
     pub cluster_decay_isolated_factor: f64,
+    /// Minimum similarity score for pattern injection (filters noise).
+    #[serde(default = "default_min_injection_similarity")]
+    pub min_injection_similarity: f64,
 }
 
 impl Default for PatternsConfig {
@@ -170,6 +173,7 @@ impl Default for PatternsConfig {
             outlier_recluster_threshold: default_outlier_recluster_threshold(),
             cluster_decay_active_factor: default_cluster_decay_active_factor(),
             cluster_decay_isolated_factor: default_cluster_decay_isolated_factor(),
+            min_injection_similarity: default_min_injection_similarity(),
         }
     }
 }
@@ -204,6 +208,9 @@ pub struct HooksConfig {
     pub routing: bool,
     #[serde(default = "default_true")]
     pub learning: bool,
+    /// If true, inject the full agent markdown body instead of a 1-line summary.
+    #[serde(default)]
+    pub inject_agent_body: bool,
 }
 
 impl Default for HooksConfig {
@@ -213,6 +220,7 @@ impl Default for HooksConfig {
             edit_tracking: true,
             routing: true,
             learning: true,
+            inject_agent_body: false,
         }
     }
 }
@@ -463,6 +471,9 @@ fn default_cluster_decay_active_factor() -> f64 {
 }
 fn default_cluster_decay_isolated_factor() -> f64 {
     2.0
+}
+fn default_min_injection_similarity() -> f64 {
+    0.55
 }
 fn default_tmux_session() -> String {
     "flowforge".to_string()
