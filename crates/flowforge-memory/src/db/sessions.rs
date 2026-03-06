@@ -9,7 +9,7 @@ impl MemoryDb {
     pub fn create_session(&self, session: &SessionInfo) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO sessions (id, started_at, ended_at, cwd, edits, commands, summary, transcript_path)
+                "INSERT OR IGNORE INTO sessions (id, started_at, ended_at, cwd, edits, commands, summary, transcript_path)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     session.id,
@@ -21,6 +21,18 @@ impl MemoryDb {
                     session.summary,
                     session.transcript_path,
                 ],
+            )
+            .sq()?;
+        Ok(())
+    }
+
+    /// Reopen a previously-ended session (for resume scenarios).
+    /// Sets ended_at back to NULL so it appears active again.
+    pub fn reopen_session(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET ended_at = NULL WHERE id = ?1 AND ended_at IS NOT NULL",
+                params![id],
             )
             .sq()?;
         Ok(())
@@ -53,6 +65,30 @@ impl MemoryDb {
                 .sq()?;
             Ok(())
         })
+    }
+
+    /// Get a specific session by ID (regardless of ended_at status).
+    pub fn get_session_by_id(&self, id: &str) -> Result<Option<SessionInfo>> {
+        self.conn
+            .query_row(
+                "SELECT id, started_at, ended_at, cwd, edits, commands, summary, transcript_path
+                 FROM sessions WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(SessionInfo {
+                        id: row.get(0)?,
+                        started_at: parse_datetime(row.get::<_, String>(1)?),
+                        ended_at: row.get::<_, Option<String>>(2)?.map(parse_datetime),
+                        cwd: row.get(3)?,
+                        edits: row.get(4)?,
+                        commands: row.get(5)?,
+                        summary: row.get(6)?,
+                        transcript_path: row.get(7).ok().flatten(),
+                    })
+                },
+            )
+            .optional()
+            .sq()
     }
 
     pub fn get_current_session(&self) -> Result<Option<SessionInfo>> {

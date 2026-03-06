@@ -19,7 +19,7 @@ pub fn run() -> Result<()> {
         ctx.with_db("session_init", |db| {
             let now = Utc::now();
 
-            // Create session record
+            // Create session record (INSERT OR IGNORE to preserve existing data on resume)
             let session = SessionInfo {
                 id: session_id.clone(),
                 started_at: now,
@@ -31,6 +31,9 @@ pub fn run() -> Result<()> {
                 transcript_path: input.common.transcript_path.clone(),
             };
             db.create_session(&session)?;
+
+            // If session exists but was ended (resume scenario), reopen it
+            db.reopen_session(session_id)?;
 
             // Create trajectory for this session
             let trajectory = Trajectory {

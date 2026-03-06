@@ -10,11 +10,16 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Capture session BEFORE ending it (same pattern as session_end)
-    let current_session = ctx.with_db("get_current_session", |db| db.get_current_session());
-    let current_session = current_session.flatten();
+    // Use the specific session ID from the hook input (avoids ending the wrong session)
+    let current_session = if let Some(ref sid) = ctx.session_id {
+        ctx.with_db("get_session_by_id", |db| db.get_session_by_id(sid))
+            .flatten()
+    } else {
+        ctx.with_db("get_current_session", |db| db.get_current_session())
+            .flatten()
+    };
 
-    // End current session
+    // End the specific session
     if let Some(ref session) = current_session {
         let sid = session.id.clone();
         ctx.with_db("end_session", |db| db.end_session(&sid, Utc::now()));
