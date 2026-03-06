@@ -20,12 +20,15 @@ impl CommonHookFields {
     /// Extract common fields from a raw JSON value.
     pub fn from_value(v: &Value) -> Self {
         Self {
+            // Claude Code sends camelCase (sessionId), check both variants
             session_id: v
-                .get("session_id")
+                .get("sessionId")
+                .or_else(|| v.get("session_id"))
                 .and_then(|x| x.as_str())
                 .map(String::from),
             transcript_path: v
-                .get("transcript_path")
+                .get("transcriptPath")
+                .or_else(|| v.get("transcript_path"))
                 .and_then(|x| x.as_str())
                 .map(String::from),
             cwd: v.get("cwd").and_then(|x| x.as_str()).map(String::from),
@@ -343,7 +346,8 @@ impl SessionStartInput {
     pub fn from_value(v: &Value) -> crate::Result<Self> {
         Ok(Self {
             source: opt_str(v, "source"),
-            session_id: opt_str(v, "session_id"),
+            // Claude Code sends camelCase (sessionId)
+            session_id: opt_str(v, "sessionId").or_else(|| opt_str(v, "session_id")),
             common: CommonHookFields::from_value(v),
         })
     }
@@ -382,8 +386,9 @@ impl PreCompactInput {
 impl SubagentStartInput {
     pub fn from_value(v: &Value) -> crate::Result<Self> {
         Ok(Self {
-            agent_id: opt_str(v, "agent_id"),
-            agent_type: opt_str(v, "agent_type"),
+            // Claude Code sends camelCase
+            agent_id: opt_str(v, "agentId").or_else(|| opt_str(v, "agent_id")),
+            agent_type: opt_str(v, "agentType").or_else(|| opt_str(v, "agent_type")),
             common: CommonHookFields::from_value(v),
         })
     }
@@ -392,8 +397,10 @@ impl SubagentStartInput {
 impl SubagentStopInput {
     pub fn from_value(v: &Value) -> crate::Result<Self> {
         Ok(Self {
-            agent_id: opt_str(v, "agent_id"),
-            last_assistant_message: opt_str(v, "last_assistant_message"),
+            // Claude Code sends camelCase
+            agent_id: opt_str(v, "agentId").or_else(|| opt_str(v, "agent_id")),
+            last_assistant_message: opt_str(v, "lastAssistantMessage")
+                .or_else(|| opt_str(v, "last_assistant_message")),
             common: CommonHookFields::from_value(v),
         })
     }
