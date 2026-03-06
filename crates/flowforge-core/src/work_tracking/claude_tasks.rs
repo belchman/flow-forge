@@ -4,7 +4,7 @@
 use tracing::warn;
 
 use crate::config::WorkTrackingConfig;
-use crate::types::{WorkFilter, WorkItem};
+use crate::types::{WorkFilter, WorkItem, WorkStatus};
 use crate::Result;
 
 use super::WorkDb;
@@ -16,9 +16,10 @@ pub fn sync_to_claude_tasks(item: &WorkItem, config: &WorkTrackingConfig) -> Res
     }
 
     // Map blocked → pending (Claude Code doesn't have a blocked status)
-    let claude_status = match item.status.as_str() {
-        "blocked" => "pending",
-        s => s,
+    let claude_status = if item.status == WorkStatus::Blocked {
+        "pending".to_string()
+    } else {
+        item.status.to_string()
     };
 
     let task_file = tasks_dir.join(format!("{}.json", item.id));
@@ -90,7 +91,7 @@ pub fn sync_all_to_claude_tasks(db: &dyn WorkDb, config: &WorkTrackingConfig) ->
     let items = db.list_work_items(&WorkFilter::default())?;
     let mut synced = 0u32;
     for item in &items {
-        if item.status != "completed" {
+        if item.status != WorkStatus::Completed {
             sync_to_claude_tasks(item, config)?;
             synced += 1;
         }
@@ -155,7 +156,11 @@ pub(crate) fn sync_from_claude_tasks(db: &dyn WorkDb, config: &WorkTrackingConfi
                 .unwrap_or("(untitled)")
                 .to_string(),
             description: item["description"].as_str().map(|s| s.to_string()),
-            status: item["status"].as_str().unwrap_or("pending").to_string(),
+            status: item["status"]
+                .as_str()
+                .unwrap_or("pending")
+                .parse()
+                .unwrap_or(WorkStatus::Pending),
             assignee: item["owner"].as_str().map(|s| s.to_string()),
             parent_id: None,
             priority: 2,

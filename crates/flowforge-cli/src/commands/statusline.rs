@@ -3,7 +3,6 @@ use flowforge_core::{AgentSessionStatus, FlowForgeConfig, Result};
 use flowforge_memory::MemoryDb;
 
 const SEP: &str = "\u{2502}"; // │
-const HSEP: &str = "\u{2500}"; // ─
 
 #[allow(clippy::print_literal, clippy::format_in_format_args)]
 pub fn run() -> Result<()> {
@@ -76,16 +75,11 @@ pub fn run() -> Result<()> {
     let mut lines = Vec::new();
 
     // ══════════════════════════════════════════════════════════════
-    // LINE 1: Header — brand + git + model + context + duration
+    // LINE 1: Header — project + git + model + context + duration
     // ══════════════════════════════════════════════════════════════
     let display_name = session_name.unwrap_or(&project_name);
-    let mut header_parts: Vec<String> = vec![format!(
-        "{} {}",
-        "\u{258A}".bold().bright_magenta(), // ▊
-        format!("FlowForge {}", display_name)
-            .bold()
-            .bright_magenta()
-    )];
+    let mut header_parts: Vec<String> =
+        vec![display_name.bold().bright_magenta().to_string()];
 
     // Git branch + changes
     if let Some(ref branch) = git_branch {
@@ -140,24 +134,14 @@ pub fn run() -> Result<()> {
     let sep = format!("  {}  ", SEP.dimmed());
     lines.push(header_parts.join(&sep));
 
-    // Separator
-    lines.push(HSEP.repeat(53).dimmed().to_string());
-
     // ══════════════════════════════════════════════════════════════
-    // LINE 2: Learn — pattern progress + clusters + routes + IQ
+    // LINE 2: Intelligence + Session metrics
     // ══════════════════════════════════════════════════════════════
     if let Some(ref db) = db {
-        let short = db.count_patterns_short().unwrap_or(0);
         let long = db.count_patterns_long().unwrap_or(0);
-        let clusters = db.get_all_clusters().map(|c| c.len()).unwrap_or(0);
-        let routes = db.count_routing_weights().unwrap_or(0);
-        let vectors = db.count_vectors().unwrap_or(0) as u64;
+        let mut parts: Vec<String> = Vec::new();
 
-        let intel = compute_intelligence(short, long, vectors, clusters as u64, routes, Some(db));
-
-        let mut learn_parts: Vec<String> = Vec::new();
-
-        // Pattern counts: "N proven  N recent"
+        // Proven patterns
         let long_str = if long > 10 {
             format!("{}", long).bright_green().to_string()
         } else if long > 0 {
@@ -165,69 +149,29 @@ pub fn run() -> Result<()> {
         } else {
             "0".dimmed().to_string()
         };
-        learn_parts.push(format!(
-            "{} proven  {} recent",
-            long_str,
-            format!("{}", short).dimmed()
-        ));
+        parts.push(format!("{} proven", long_str));
 
-        // Clusters
-        if clusters > 0 {
-            learn_parts.push(format!("{} clusters", clusters).bright_green().to_string());
-        }
+        // Trajectory success rate
+        let traj_rate = db.recent_trajectory_success_rate(20).unwrap_or(0.0);
+        let traj_pct = (traj_rate * 100.0) as u32;
+        let traj_str = format!("traj {}%", traj_pct);
+        parts.push(color_by_ratio(traj_rate, &traj_str));
 
-        // Routes
-        if routes > 0 {
-            learn_parts.push(format!("{} routes", routes).bright_green().to_string());
-        }
-
-        // Intelligence score
-        let intel_str = format!("IQ {}%", intel);
-        let intel_colored = if intel >= 80 {
-            intel_str.bright_green().to_string()
-        } else if intel >= 40 {
-            intel_str.bright_yellow().to_string()
-        } else {
-            intel_str.dimmed().to_string()
-        };
-        learn_parts.push(intel_colored);
-
-        lines.push(format!(
-            "{}  {}",
-            "Learn:".bright_cyan(),
-            learn_parts.join("  ")
-        ));
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // LINE 3: Swarm — agents + trust + trajectory + work + warnings
-    // ══════════════════════════════════════════════════════════════
-    if let Some(ref db) = db {
-        let mut swarm_parts: Vec<String> = Vec::new();
-
-        // Agents: "N active (names)" or "no agents"
-        // Scope to current session to avoid showing stale agents from previous sessions
-        let current_session_id = db.get_current_session().ok().flatten().map(|s| s.id);
-        let (active_count, idle_count, agent_names) =
-            get_agent_summary(db, current_session_id.as_deref());
-        let total = active_count + idle_count;
-        if total > 0 {
-            swarm_parts.push(format!(
-                "{} active ({})",
-                format!("{}", active_count).bright_green(),
-                if !agent_names.is_empty() {
-                    agent_names.join(" ")
-                } else {
-                    "--".dimmed().to_string()
-                }
-            ));
-        } else {
-            swarm_parts.push("no agents".dimmed().to_string());
+        // Routing accuracy (only if enough data)
+        let (routing_hits, routing_total) = db.routing_accuracy_stats().unwrap_or((0, 0));
+        if routing_total > 2 {
+            let route_rate = routing_hits as f64 / routing_total as f64;
+            let route_pct = (route_rate * 100.0) as u32;
+            let route_str = format!("route {}%", route_pct);
+            parts.push(color_by_ratio(route_rate, &route_str));
         }
 
         // Session-dependent metrics
         if let Ok(Some(session)) = db.get_current_session() {
             let sid = &session.id;
+
+            // Separator
+            parts.push(SEP.dimmed().to_string());
 
             // Trust score
             if let Ok(Some(trust)) = db.get_trust_score(sid) {
@@ -237,49 +181,79 @@ pub fn run() -> Result<()> {
                 if trust.denials > 0 {
                     detail = format!("{} {}", detail, format!("{}deny", trust.denials).red());
                 }
-                swarm_parts.push(detail);
+                parts.push(detail);
             }
 
-            // Trajectory progress
-            if let Ok(Some(traj)) = db.get_active_trajectory(sid) {
-                let steps = db.get_trajectory_steps(&traj.id).unwrap_or_default();
-                let step_count = steps.len();
-                if step_count > 0 {
-                    let successes = steps
-                        .iter()
-                        .filter(|s| s.outcome == flowforge_core::trajectory::StepOutcome::Success)
-                        .count();
-                    let ratio = successes as f64 / step_count as f64;
-                    let bar = progress_bar(ratio, 4);
-                    let pct = format!("{}%", (ratio * 100.0) as u32);
-                    let colored = color_by_ratio(ratio, &pct);
-                    swarm_parts.push(format!("traj {}{}", bar, colored));
-                }
+            // Session error count
+            let errs = db.count_session_failures(sid).unwrap_or(0);
+            let err_str = format!("{} errs", errs);
+            if errs == 0 {
+                parts.push(err_str.green().to_string());
+            } else {
+                parts.push(err_str.red().to_string());
             }
 
-            // Unread mail
-            if let Ok(unread) = db.get_unread_messages(sid) {
-                if !unread.is_empty() {
-                    swarm_parts.push(format!("{} mail", unread.len()).bright_yellow().to_string());
-                }
-            }
+            // Checkpoint count
+            let cps = db.list_checkpoints(sid).map(|c| c.len()).unwrap_or(0);
+            parts.push(format!("{} cp", cps).dimmed().to_string());
+
+            // Separator
+            parts.push(SEP.dimmed().to_string());
 
             // Session activity
-            if session.edits > 0 || session.commands > 0 {
-                let mut activity = Vec::new();
-                if session.edits > 0 {
-                    activity.push(format!("{} edits", session.edits));
+            let mut activity = Vec::new();
+            if session.edits > 0 {
+                activity.push(format!("{} edits", session.edits));
+            }
+            if session.commands > 0 {
+                activity.push(format!("{} cmds", session.commands));
+            }
+            if !activity.is_empty() {
+                parts.push(activity.join(" ").dimmed().to_string());
+            }
+        }
+
+        lines.push(parts.join("  "));
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // LINE 3: Work + Agents + Warnings (only if content exists)
+    // ══════════════════════════════════════════════════════════════
+    if let Some(ref db) = db {
+        let mut line3_parts: Vec<String> = Vec::new();
+
+        // Agents (only when active)
+        let current_session_id = db.get_current_session().ok().flatten().map(|s| s.id);
+        let (active_count, idle_count, agent_names) =
+            get_agent_summary(db, current_session_id.as_deref());
+        let total_agents = active_count + idle_count;
+        if total_agents > 0 {
+            line3_parts.push(format!(
+                "{} agents ({})",
+                format!("{}", total_agents).bright_green(),
+                if !agent_names.is_empty() {
+                    agent_names.join(" ")
+                } else {
+                    "--".dimmed().to_string()
                 }
-                if session.commands > 0 {
-                    activity.push(format!("{} cmds", session.commands));
+            ));
+        }
+
+        // Unread mail
+        if let Some(ref sid) = current_session_id {
+            if let Ok(unread) = db.get_unread_messages(sid) {
+                if !unread.is_empty() {
+                    line3_parts
+                        .push(format!("{} mail", unread.len()).bright_yellow().to_string());
                 }
-                swarm_parts.push(activity.join(" ").dimmed().to_string());
             }
         }
 
         // Work items
-        let wip = db.count_work_items_by_status("in_progress").unwrap_or(0);
-        let pending = db.count_work_items_by_status("pending").unwrap_or(0);
+        let wip =
+            db.count_work_items_by_status(flowforge_core::WorkStatus::InProgress).unwrap_or(0);
+        let pending =
+            db.count_work_items_by_status(flowforge_core::WorkStatus::Pending).unwrap_or(0);
         if wip > 0 || pending > 0 {
             let mut w = Vec::new();
             if wip > 0 {
@@ -288,10 +262,10 @@ pub fn run() -> Result<()> {
             if pending > 0 {
                 w.push(format!("{} work pending", pending));
             }
-            swarm_parts.push(w.join("  ").bright_blue().to_string());
+            line3_parts.push(w.join("  ").bright_blue().to_string());
         }
 
-        // Warnings (keep prominent, not buried in debug)
+        // Warnings
         let mut warn_parts = Vec::new();
         if let Ok(stealable) = db.get_stealable_items(5) {
             if !stealable.is_empty() {
@@ -308,92 +282,14 @@ pub fn run() -> Result<()> {
             }
         }
         if !warn_parts.is_empty() {
-            swarm_parts.push(format!("!! {}", warn_parts.join(" ")));
+            line3_parts.push(format!("!! {}", warn_parts.join(" ")));
         }
 
-        lines.push(format!(
-            "{}  {}",
-            "Swarm:".bright_yellow(),
-            swarm_parts.join("  ")
-        ));
+        // Only print line 3 if there's content
+        if !line3_parts.is_empty() {
+            lines.push(line3_parts.join("  {}  ").replace("{}", &SEP.dimmed().to_string()));
+        }
     }
-
-    // ══════════════════════════════════════════════════════════════
-    // LINE 4: Debug — infrastructure internals (dimmed)
-    // ══════════════════════════════════════════════════════════════
-    if let Some(ref db) = db {
-        let vectors = db.count_vectors().unwrap_or(0) as u64;
-        let memories = db.count_kv().unwrap_or(0);
-
-        let is_semantic = config
-            .as_ref()
-            .map(|c| c.patterns.semantic_embeddings)
-            .unwrap_or(false);
-
-        let embedder = if is_semantic { "sem384" } else { "hash128" };
-
-        let hnsw = if vectors > 10000 {
-            "HNSW:12500x"
-        } else if vectors > 1000 {
-            "HNSW:150x"
-        } else if vectors > 0 {
-            "HNSW"
-        } else {
-            "brute"
-        };
-
-        // DB size
-        let db_size = config
-            .as_ref()
-            .and_then(|c| std::fs::metadata(c.db_path()).ok())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let db_str = if db_size > 1024 * 1024 {
-            format!("{:.1}MB", db_size as f64 / (1024.0 * 1024.0))
-        } else {
-            format!("{}KB", db_size / 1024)
-        };
-
-        // Hooks count
-        let hooks_path = std::env::current_dir()
-            .unwrap_or_default()
-            .join(".claude/settings.json");
-        let hooks_count = if hooks_path.exists() {
-            std::fs::read_to_string(&hooks_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("hooks").cloned())
-                .map(|h| h.as_object().map(|o| o.len()).unwrap_or(0))
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        // MCP
-        let mcp_path = std::env::current_dir()
-            .unwrap_or_default()
-            .join(".mcp.json");
-        let mcp_str = if mcp_path.exists() { "MCP53" } else { "MCP--" };
-
-        let debug_parts = [
-            embedder.to_string(),
-            format!("{}vec", vectors),
-            hnsw.to_string(),
-            db_str,
-            format!("{}hooks", hooks_count),
-            mcp_str.to_string(),
-            format!("{}kv", memories),
-        ];
-
-        lines.push(
-            format!("debug:  {}", debug_parts.join("  "))
-                .dimmed()
-                .to_string(),
-        );
-    }
-
-    // Footer separator
-    lines.push(HSEP.repeat(53).dimmed().to_string());
 
     // Print multi-line dashboard
     println!("{}", lines.join("\n"));
@@ -405,39 +301,30 @@ pub fn run() -> Result<()> {
 #[allow(clippy::print_literal)]
 pub fn print_legend() -> Result<()> {
     println!("{}", "FlowForge Dashboard Legend".bold().cyan());
-    println!("{}", HSEP.repeat(53).dimmed());
     println!();
 
     println!("{}", "HEADER LINE".bold());
-    println!(
-        "  {} {}  Brand + project/session name",
-        "\u{258A}".bold().bright_magenta(),
-        "FlowForge".bold().bright_magenta()
-    );
+    println!("  project      Project or session name");
     println!("  branch       Git branch with +staged ~modified ?untracked");
     println!("  op4.6        Model name (Opus 4.6, Sonnet 4.6, etc.)");
     println!("  ctx 23%      Context window usage (green<50 cyan<70 yellow<85 red)");
     println!("  5m           Session duration");
     println!();
 
-    println!("{}", "LEARN LINE".bold());
-    println!("  N proven     Long-term patterns (promoted from short-term)");
-    println!("  N recent     Short-term patterns (not yet promoted)");
-    println!("  N clusters   DBSCAN topic clusters");
-    println!("  N routes     Learned agent routing weights");
-    println!("  IQ N%        Intelligence score (70% outcomes + 30% volume)");
-    println!();
-
-    println!("{}", "SWARM LINE".bold());
-    println!("  N active     Active agents with shortened names");
+    println!("{}", "INTELLIGENCE + SESSION LINE".bold());
+    println!("  N proven     Long-term validated patterns");
+    println!("  traj N%      Trajectory success rate (last 20 judged)");
+    println!("  route N%     Routing accuracy (shown when >2 data points)");
     println!("  trust N%     Guidance trust score (green>=80 yellow>=50 red)");
-    println!(
-        "  traj {}N%  Trajectory success ratio bar",
-        progress_bar(0.85, 4)
-    );
-    println!("  N mail       Unread co-agent messages");
+    println!("  N errs       Distinct tool failures this session (green=0 red>0)");
+    println!("  N cp         Checkpoint count (rollback safety points)");
     println!("  N edits      File edits this session");
     println!("  N cmds       Commands run this session");
+    println!();
+
+    println!("{}", "WORK + AGENTS LINE (shown when applicable)".bold());
+    println!("  N agents     Active/idle agents with shortened names");
+    println!("  N mail       Unread co-agent messages");
     println!("  N work active   In-progress work items");
     println!("  N work pending  Pending work items");
     println!("  !! stale     Stealable work items (warning)");
@@ -445,17 +332,6 @@ pub fn print_legend() -> Result<()> {
         "  !! {}    Hook error log not empty (warning)",
         "hook-err".red()
     );
-    println!();
-
-    println!("{}", "DEBUG LINE (infrastructure)".bold());
-    println!("  sem384       Semantic embedder (AllMiniLM, 384-dim)");
-    println!("  hash128      Hash embedder (xxhash n-gram, 128-dim)");
-    println!("  Nvec         Vector count in HNSW index");
-    println!("  HNSW:Nx      Index speedup tier (brute / HNSW / HNSW:150x / HNSW:12500x)");
-    println!("  N.NMB        Database file size");
-    println!("  Nhooks       Claude Code hooks wired");
-    println!("  MCPN         MCP server tool count");
-    println!("  Nkv          Key-value memory entries");
     println!();
 
     println!(
@@ -498,26 +374,6 @@ fn color_by_trust(score: f64, text: &str) -> String {
     }
 }
 
-/// Compact progress bar using Unicode block/dot characters
-fn progress_bar(ratio: f64, width: usize) -> String {
-    let filled = (ratio * width as f64).round() as usize;
-    let empty = width.saturating_sub(filled);
-    let fill_char = "\u{25CF}"; // ●
-    let empty_char = "\u{25CB}"; // ○
-
-    let bar_color = if ratio >= 0.9 {
-        fill_char.repeat(filled).green()
-    } else if ratio >= 0.7 {
-        fill_char.repeat(filled).yellow()
-    } else if ratio > 0.0 {
-        fill_char.repeat(filled).red()
-    } else {
-        fill_char.repeat(filled).dimmed()
-    };
-
-    format!("[{}{}]", bar_color, empty_char.repeat(empty).dimmed())
-}
-
 /// Parse git status --porcelain output into (staged, modified, untracked) counts
 fn parse_git_porcelain(output: &str) -> (u32, u32, u32) {
     let (mut staged, mut modified, mut untracked) = (0, 0, 0);
@@ -540,83 +396,6 @@ fn parse_git_porcelain(output: &str) -> (u32, u32, u32) {
         }
     }
     (staged, modified, untracked)
-}
-
-/// Outcome metrics for intelligence score v2
-struct OutcomeMetrics {
-    trajectory_success_rate: f64,
-    routing_accuracy: f64,
-    routing_total: u64,
-    promotion_rate: f64,
-    route_count: u64,
-}
-
-fn get_outcome_metrics(db: &MemoryDb) -> OutcomeMetrics {
-    let trajectory_success_rate = db.recent_trajectory_success_rate(20).unwrap_or(0.0);
-    let (routing_hits, routing_total) = db.routing_accuracy_stats().unwrap_or((0, 0));
-    let routing_accuracy = if routing_total > 0 {
-        routing_hits as f64 / routing_total as f64
-    } else {
-        0.0
-    };
-
-    let short = db.count_patterns_short().unwrap_or(0);
-    let long = db.count_patterns_long().unwrap_or(0);
-    let total_patterns = short + long;
-    let promotion_rate = if total_patterns > 0 {
-        long as f64 / total_patterns as f64
-    } else {
-        0.0
-    };
-
-    let route_count = db.count_routing_weights().unwrap_or(0);
-
-    OutcomeMetrics {
-        trajectory_success_rate,
-        routing_accuracy,
-        routing_total,
-        promotion_rate,
-        route_count,
-    }
-}
-
-/// Compute intelligence score (0-100) — outcome-based (70%) + volume (30%)
-fn compute_intelligence(
-    short_patterns: u64,
-    long_patterns: u64,
-    vectors: u64,
-    clusters: u64,
-    _routes: u64,
-    db: Option<&MemoryDb>,
-) -> u32 {
-    // Volume (30%): patterns (15 max) + vectors (10 max) + clusters (5 max)
-    let pattern_score = ((short_patterns as f64 * 0.1) + (long_patterns as f64 * 1.0)).min(15.0);
-    let vector_score = if vectors > 0 {
-        ((vectors as f64).ln() * 2.0).min(10.0)
-    } else {
-        0.0
-    };
-    let cluster_score = (clusters as f64 * 2.5).min(5.0);
-    let volume = pattern_score + vector_score + cluster_score;
-
-    // Outcome (70%): trajectory success (30) + routing accuracy (20) + promotion (10) + routes (10)
-    let outcome = if let Some(db) = db {
-        let m = get_outcome_metrics(db);
-        let traj_score = m.trajectory_success_rate * 30.0;
-        let routing_score = if m.routing_total > 2 {
-            m.routing_accuracy * 20.0
-        } else {
-            0.0
-        };
-        let promo_score = m.promotion_rate * 10.0;
-        let route_score = (m.route_count as f64 * 2.0).min(10.0);
-        traj_score + routing_score + promo_score + route_score
-    } else {
-        0.0
-    };
-
-    let total = volume + outcome;
-    (total.min(100.0)) as u32
 }
 
 /// Get agent summary: (active_count, idle_count, formatted_names)

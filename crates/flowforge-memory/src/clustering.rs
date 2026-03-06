@@ -41,15 +41,34 @@ impl<'a> ClusterManager<'a> {
         Self { db, config }
     }
 
+    /// Maximum vectors for DBSCAN to avoid O(n^2) memory blowup.
+    /// At 2000 vectors, the distance matrix is ~32MB (manageable).
+    const MAX_CLUSTERING_VECTORS: usize = 2000;
+
+    /// Maximum vectors for tune() k-distance computation.
+    const MAX_TUNE_VECTORS: usize = 500;
+
     /// Run DBSCAN over all pattern vectors and update cluster assignments.
     /// Uses L2 distance on already-normalized vectors (equivalent to cosine distance).
+    /// Caps input to MAX_CLUSTERING_VECTORS via random sampling to prevent memory blowup.
     pub fn recluster(&self) -> Result<ClusterResult> {
-        let vectors = self.db.get_all_pattern_vectors()?;
+        let mut vectors = self.db.get_all_pattern_vectors()?;
         if vectors.len() < self.config.clustering_min_points {
             return Ok(ClusterResult {
                 cluster_count: 0,
                 outlier_count: vectors.len(),
             });
+        }
+
+        // Cap to MAX_CLUSTERING_VECTORS via deterministic sampling to prevent O(n^2) blowup
+        if vectors.len() > Self::MAX_CLUSTERING_VECTORS {
+            // Take evenly spaced samples to preserve distribution
+            let step = vectors.len() as f64 / Self::MAX_CLUSTERING_VECTORS as f64;
+            let sampled: Vec<_> = (0..Self::MAX_CLUSTERING_VECTORS)
+                .map(|i| (i as f64 * step) as usize)
+                .map(|idx| vectors[idx.min(vectors.len() - 1)].clone())
+                .collect();
+            vectors = sampled;
         }
 
         let n = vectors.len();
@@ -200,8 +219,20 @@ impl<'a> ClusterManager<'a> {
     /// Auto-tune DBSCAN parameters via k-distance elbow detection.
     /// Computes k-th nearest neighbor distance for each vector (k = min_points),
     /// sorts descending, and finds the elbow via max second derivative.
+    /// Caps input to MAX_TUNE_VECTORS via sampling to prevent O(n^2) blowup.
     pub fn tune(&self) -> Result<TuneResult> {
-        let vectors = self.db.get_all_pattern_vectors()?;
+        let mut vectors = self.db.get_all_pattern_vectors()?;
+
+        // Cap to MAX_TUNE_VECTORS via evenly spaced sampling
+        if vectors.len() > Self::MAX_TUNE_VECTORS {
+            let step = vectors.len() as f64 / Self::MAX_TUNE_VECTORS as f64;
+            let sampled: Vec<_> = (0..Self::MAX_TUNE_VECTORS)
+                .map(|i| (i as f64 * step) as usize)
+                .map(|idx| vectors[idx.min(vectors.len() - 1)].clone())
+                .collect();
+            vectors = sampled;
+        }
+
         let n = vectors.len();
         let k = self.config.clustering_min_points;
 

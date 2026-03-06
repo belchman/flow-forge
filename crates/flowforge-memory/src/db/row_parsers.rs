@@ -1,7 +1,7 @@
 use flowforge_core::{
     trajectory::{Trajectory, TrajectoryStatus, TrajectoryVerdict},
     AgentSession, AgentSessionStatus, Checkpoint, ConversationMessage, MailboxMessage, SessionFork,
-    WorkItem,
+    WorkItem, WorkStatus,
 };
 
 use super::parse_datetime;
@@ -81,7 +81,11 @@ pub(crate) fn parse_work_item_row(row: &rusqlite::Row) -> WorkItem {
         item_type: row.get(3).unwrap_or_else(|_| "task".to_string()),
         title: row.get(4).unwrap_or_default(),
         description: row.get(5).unwrap_or_default(),
-        status: row.get(6).unwrap_or_else(|_| "pending".to_string()),
+        status: row
+            .get::<_, String>(6)
+            .unwrap_or_else(|_| "pending".to_string())
+            .parse()
+            .unwrap_or(WorkStatus::Pending),
         assignee: row.get(7).unwrap_or_default(),
         parent_id: row.get(8).unwrap_or_default(),
         priority: row.get(9).unwrap_or(2),

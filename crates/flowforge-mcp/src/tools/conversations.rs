@@ -120,7 +120,7 @@ pub fn checkpoint_get(db: &MemoryDb, p: &Value) -> flowforge_core::Result<Value>
 }
 
 pub fn session_fork(db: &MemoryDb, p: &Value) -> flowforge_core::Result<Value> {
-    let session_id = p.str_or("session_id", "");
+    let session_id = p.require_str("session_id")?;
     let checkpoint_name = p.opt_str("checkpoint_name");
     let at_index = p.opt_u32("at_index");
     let reason = p.opt_str("reason");

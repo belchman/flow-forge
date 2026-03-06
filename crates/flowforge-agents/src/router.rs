@@ -178,15 +178,14 @@ impl AgentRouter {
         // Check for exact or pattern-based matches in the learned weights
         for ((task_pattern, agent_name), weight) in learned_weights {
             if agent_name == &agent.name {
-                match Regex::new(task_pattern) {
-                    Ok(re) => {
+                // Prefer substring match (fast path, no regex compilation)
+                if task.contains(task_pattern.as_str()) {
+                    return *weight;
+                }
+                // Only try regex if pattern contains metacharacters
+                if task_pattern.contains(|c: char| ".*+?()[]{}|\\^$".contains(c)) {
+                    if let Ok(re) = Regex::new(task_pattern) {
                         if re.is_match(task) {
-                            return *weight;
-                        }
-                    }
-                    Err(_) => {
-                        // Fall back to substring matching if the pattern isn't valid regex
-                        if task.contains(task_pattern.as_str()) {
                             return *weight;
                         }
                     }

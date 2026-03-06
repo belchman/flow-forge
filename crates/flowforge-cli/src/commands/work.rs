@@ -3,7 +3,7 @@ use colored::Colorize;
 use uuid::Uuid;
 
 use flowforge_core::work_tracking;
-use flowforge_core::{FlowForgeConfig, Result, WorkFilter, WorkItem};
+use flowforge_core::{FlowForgeConfig, Result, WorkFilter, WorkItem, WorkStatus};
 use flowforge_memory::MemoryDb;
 
 fn open_db(config: &FlowForgeConfig) -> Result<MemoryDb> {
@@ -39,7 +39,7 @@ pub fn create(
         item_type: item_type.to_string(),
         title: title.to_string(),
         description: description.map(|s| s.to_string()),
-        status: "pending".to_string(),
+        status: WorkStatus::Pending,
         assignee: None,
         parent_id: parent.map(|s| s.to_string()),
         priority,
@@ -72,18 +72,23 @@ pub fn create(
     Ok(())
 }
 
-pub fn list(status: Option<&str>, item_type: Option<&str>) -> Result<()> {
+pub fn list(status: Option<&str>, item_type: Option<&str>, json: bool) -> Result<()> {
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
     let db = open_db(&config)?;
 
     let filter = WorkFilter {
-        status: status.map(|s| s.to_string()),
+        status: status.and_then(|s| s.parse().ok()),
         item_type: item_type.map(|s| s.to_string()),
         limit: Some(50),
         ..Default::default()
     };
 
     let items = work_tracking::list_items(&db, &filter)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
+        return Ok(());
+    }
 
     if items.is_empty() {
         println!("No work items found.");
@@ -94,11 +99,12 @@ pub fn list(status: Option<&str>, item_type: Option<&str>) -> Result<()> {
     println!("{} ({} backend)\n", "Work Items".bold(), backend);
 
     for item in &items {
-        let status_colored = match item.status.as_str() {
-            "completed" => item.status.green(),
-            "in_progress" => item.status.yellow(),
-            "blocked" => item.status.red(),
-            _ => item.status.normal(),
+        let status_str = item.status.to_string();
+        let status_colored = match item.status {
+            WorkStatus::Completed => status_str.green(),
+            WorkStatus::InProgress => status_str.yellow(),
+            WorkStatus::Blocked => status_str.red(),
+            WorkStatus::Pending => status_str.normal(),
         };
 
         let short_id: String = item.id.chars().take(8).collect();
@@ -123,10 +129,14 @@ pub fn update(id: &str, status: &str) -> Result<()> {
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
     let db = open_db(&config)?;
 
+    let parsed_status: WorkStatus = status
+        .parse()
+        .map_err(|e: String| flowforge_core::Error::Config(e))?;
+
     // Try to find the item by partial ID match
     let full_id = resolve_id(&db, id)?;
 
-    work_tracking::update_status(&db, &config.work_tracking, &full_id, status, "user")?;
+    work_tracking::update_status(&db, &config.work_tracking, &full_id, parsed_status, "user")?;
 
     println!("{} Updated {} → {}", "✓".green(), id, status);
     Ok(())
@@ -166,16 +176,37 @@ pub fn sync() -> Result<()> {
     Ok(())
 }
 
-pub fn status() -> Result<()> {
+pub fn status(json: bool) -> Result<()> {
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
     let db = open_db(&config)?;
 
     let backend = work_tracking::detect_backend(&config.work_tracking);
 
-    let pending = db.count_work_items_by_status("pending").unwrap_or(0);
-    let in_progress = db.count_work_items_by_status("in_progress").unwrap_or(0);
-    let completed = db.count_work_items_by_status("completed").unwrap_or(0);
-    let blocked = db.count_work_items_by_status("blocked").unwrap_or(0);
+    let pending = db.count_work_items_by_status(WorkStatus::Pending).unwrap_or(0);
+    let in_progress = db.count_work_items_by_status(WorkStatus::InProgress).unwrap_or(0);
+    let completed = db.count_work_items_by_status(WorkStatus::Completed).unwrap_or(0);
+    let blocked = db.count_work_items_by_status(WorkStatus::Blocked).unwrap_or(0);
+
+    if json {
+        let active = db
+            .list_work_items(&WorkFilter {
+                status: Some(WorkStatus::InProgress),
+                limit: Some(5),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        let obj = serde_json::json!({
+            "backend": backend.to_string(),
+            "pending": pending,
+            "in_progress": in_progress,
+            "completed": completed,
+            "blocked": blocked,
+            "total": pending + in_progress + completed + blocked,
+            "active_items": active,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
+        return Ok(());
+    }
 
     println!("{}", "Work Tracking Status".bold());
     println!("  Backend: {}", backend);
@@ -187,7 +218,7 @@ pub fn status() -> Result<()> {
 
     // Show recent active items
     let filter = WorkFilter {
-        status: Some("in_progress".to_string()),
+        status: Some(WorkStatus::InProgress),
         limit: Some(5),
         ..Default::default()
     };
@@ -409,7 +440,7 @@ pub fn load() -> Result<()> {
 
     // Show work distribution
     let in_progress = db.list_work_items(&WorkFilter {
-        status: Some("in_progress".to_string()),
+        status: Some(WorkStatus::InProgress),
         ..Default::default()
     })?;
 
@@ -462,6 +493,88 @@ pub fn load() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+pub fn heartbeat(_id: Option<&str>) -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    let session_id = db
+        .get_current_session()?
+        .map(|s| s.id)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let updated = db.update_heartbeat(&session_id)?;
+    println!(
+        "{} Heartbeat updated for {} claimed item(s)",
+        "✓".green(),
+        updated
+    );
+    Ok(())
+}
+
+pub fn get(id: &str, json: bool) -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    let full_id = resolve_id(&db, id)?;
+    let item = db
+        .get_work_item(&full_id)?
+        .ok_or_else(|| flowforge_core::Error::NotFound(format!("Work item '{}' not found", id)))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&item).unwrap_or_default());
+        return Ok(());
+    }
+
+    println!("{}", "Work Item".bold());
+    println!("  ID:          {}", item.id);
+    println!("  Title:       {}", item.title);
+    println!("  Type:        {}", item.item_type);
+    println!("  Status:      {}", item.status);
+    println!("  Priority:    {}", item.priority);
+    println!("  Backend:     {}", item.backend);
+    println!("  Progress:    {}%", item.progress);
+    if let Some(ref desc) = item.description {
+        println!("  Description: {}", desc);
+    }
+    if let Some(ref assignee) = item.assignee {
+        println!("  Assignee:    {}", assignee);
+    }
+    if let Some(ref parent) = item.parent_id {
+        println!("  Parent:      {}", parent);
+    }
+    if let Some(ref ext) = item.external_id {
+        println!("  External ID: {}", ext);
+    }
+    if let Some(ref claimed) = item.claimed_by {
+        println!("  Claimed by:  {}", claimed);
+    }
+    println!("  Created:     {}", item.created_at.format("%Y-%m-%d %H:%M"));
+    println!("  Updated:     {}", item.updated_at.format("%Y-%m-%d %H:%M"));
+    if let Some(ref completed) = item.completed_at {
+        println!("  Completed:   {}", completed.format("%Y-%m-%d %H:%M"));
+    }
+    if !item.labels.is_empty() {
+        println!("  Labels:      {}", item.labels.join(", "));
+    }
+
+    Ok(())
+}
+
+pub fn delete(id: &str) -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    let full_id = resolve_id(&db, id)?;
+    db.delete_work_item(&full_id)?;
+
+    println!(
+        "{} Deleted work item {}",
+        "✓".green(),
+        &id[..8.min(id.len())]
+    );
     Ok(())
 }
 

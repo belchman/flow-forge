@@ -49,6 +49,14 @@ impl<'a> ToolBuilder<'a> {
         self
     }
 
+    pub fn optional_bool(mut self, name: &str, desc: &str) -> Self {
+        self.properties.push((
+            name.to_string(),
+            json!({"type": "boolean", "description": desc}),
+        ));
+        self
+    }
+
     pub fn optional_int(mut self, name: &str, desc: &str) -> Self {
         self.properties.push((
             name.to_string(),

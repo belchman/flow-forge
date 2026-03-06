@@ -50,6 +50,17 @@ impl MemoryDb {
         rows.collect::<std::result::Result<Vec<_>, _>>().sq()
     }
 
+    /// Count vectors of a given source type without loading them.
+    pub fn count_vectors_for_source(&self, source_type: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM hnsw_entries WHERE source_type = ?1",
+                params![source_type],
+                |row| row.get(0),
+            )
+            .sq()
+    }
+
     pub fn delete_vectors_for_source(&self, source_type: &str, source_id: &str) -> Result<()> {
         self.conn
             .execute(
@@ -174,6 +185,31 @@ impl MemoryDb {
             .optional()
             .sq()
             .map(|o| o.flatten())
+    }
+
+    /// Pre-load cluster sizes for all pattern vectors in one JOIN query.
+    /// Returns a map from vector_id → cluster member_count.
+    /// Eliminates the N+1 pattern of get_vector_cluster_id + get_cluster per pattern.
+    pub fn get_vector_cluster_sizes(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT h.id, COALESCE(pc.member_count, 0)
+                 FROM hnsw_entries h
+                 LEFT JOIN pattern_clusters pc ON pc.id = h.cluster_id
+                 WHERE h.source_type IN ('pattern_short', 'pattern_long')
+                   AND h.cluster_id IS NOT NULL",
+            )
+            .sq()?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .sq()?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (id, count) = row.sq()?;
+            map.insert(id, count);
+        }
+        Ok(map)
     }
 
     pub fn count_vectors(&self) -> Result<i64> {

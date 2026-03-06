@@ -17,20 +17,34 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // Record trajectory failure step
+    // Record trajectory failure step + error fingerprint + failure loop tracking
+    let error_msg = input.error.clone();
+    let tool_name = input.tool_name.clone();
+    let input_json = serde_json::to_string(&input.tool_input).unwrap_or_default();
+    let input_hash = format!("{:x}", Sha256::digest(input_json.as_bytes()));
+
     ctx.with_db("record_trajectory_failure_step", |db| {
         if let Some(session) = db.get_current_session()? {
             if let Some(trajectory) = db.get_active_trajectory(&session.id)? {
-                let input_str = serde_json::to_string(&input.tool_input).unwrap_or_default();
-                let input_hash = format!("{:x}", Sha256::digest(input_str.as_bytes()));
                 db.record_trajectory_step(
                     &trajectory.id,
-                    &input.tool_name,
+                    &tool_name,
                     Some(&input_hash),
                     flowforge_core::trajectory::StepOutcome::Failure,
                     None,
                 )?;
             }
+
+            // Record error fingerprint for resolution tracking
+            if let Some(ref err) = error_msg {
+                let _ = db.record_error_occurrence(&tool_name, err);
+            }
+
+            // Record tool failure for loop detection in pre_tool_use
+            let err_preview = error_msg.as_deref().map(|e| {
+                if e.len() > 200 { &e[..200] } else { e }
+            });
+            db.record_tool_failure(&session.id, &tool_name, &input_hash, err_preview)?;
         }
         Ok(())
     });

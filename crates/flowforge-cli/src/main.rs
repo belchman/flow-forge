@@ -32,7 +32,11 @@ enum Commands {
         event: HookEvent,
     },
     /// Show FlowForge status
-    Status,
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Memory operations
     Memory {
         #[command(subcommand)]
@@ -83,6 +87,11 @@ enum Commands {
     Mailbox {
         #[command(subcommand)]
         action: MailboxAction,
+    },
+    /// Error recovery intelligence
+    Error {
+        #[command(subcommand)]
+        action: ErrorAction,
     },
     /// Guidance control plane management
     Guidance {
@@ -164,7 +173,11 @@ enum MemoryAction {
 #[derive(Subcommand)]
 enum SessionAction {
     /// Show current session info
-    Current,
+    Current {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List recent sessions
     List {
         #[arg(long, default_value_t = 10)]
@@ -223,6 +236,14 @@ enum SessionAction {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// Show hook timing metrics for a session
+    HookTiming {
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -240,7 +261,11 @@ enum LearnAction {
         limit: usize,
     },
     /// Show learning statistics
-    Stats,
+    Stats {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List recorded trajectories
     Trajectories {
         /// Filter by session ID
@@ -269,6 +294,24 @@ enum LearnAction {
     Clusters,
     /// Auto-tune DBSCAN clustering parameters
     TuneClusters,
+    /// Show failure patterns and optionally mine new ones from trajectories
+    Patterns {
+        /// Mine new patterns from failed trajectories
+        #[arg(long)]
+        mine: bool,
+        /// Minimum occurrences to consider a mined pattern significant
+        #[arg(long, default_value = "2")]
+        min_occurrences: u32,
+    },
+    /// Show file co-edit dependencies
+    Dependencies {
+        /// File path to show dependencies for (omit for full graph)
+        #[arg(long)]
+        file: Option<String>,
+        /// Max results
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -327,6 +370,9 @@ enum WorkAction {
         /// Filter by type
         #[arg(long)]
         r#type: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Update a work item's status
     Update {
@@ -344,7 +390,11 @@ enum WorkAction {
     /// Sync with external backend
     Sync,
     /// Show work tracking status
-    Status,
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show work event audit trail
     Log {
         /// Max events to show
@@ -373,6 +423,24 @@ enum WorkAction {
     },
     /// Show work distribution across agents
     Load,
+    /// Update heartbeat for a claimed work item
+    Heartbeat {
+        /// Work item ID (optional — updates all claimed items if omitted)
+        id: Option<String>,
+    },
+    /// Show full details for a work item
+    Get {
+        /// Work item ID (prefix match supported)
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a work item
+    Delete {
+        /// Work item ID (prefix match supported)
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -408,6 +476,23 @@ enum MailboxAction {
         /// Work item ID
         work_item_id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ErrorAction {
+    /// List known error patterns with occurrence counts
+    List {
+        /// Max results
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Find resolutions for an error by text
+    Find {
+        /// Error text to search for
+        error_text: String,
+    },
+    /// Show error recovery statistics
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -521,7 +606,7 @@ fn main() {
                 hooks::run_safe("task-completed", hooks::task_completed::run)
             }
         },
-        Commands::Status => commands::status::run(),
+        Commands::Status { json } => commands::status::run(json),
         Commands::Memory { action } => match action {
             MemoryAction::Get { key, namespace } => commands::memory::get(&key, &namespace),
             MemoryAction::Set {
@@ -541,7 +626,7 @@ fn main() {
             }
         }
         Commands::Session { action } => match action {
-            SessionAction::Current => commands::session::current(),
+            SessionAction::Current { json } => commands::session::current(json),
             SessionAction::List { limit } => commands::session::list(limit),
             SessionAction::Metrics => commands::session::metrics(),
             SessionAction::Agents { session_id } => {
@@ -577,11 +662,14 @@ fn main() {
                 reason.as_deref(),
             ),
             SessionAction::Forks { session_id } => commands::session::forks(session_id.as_deref()),
+            SessionAction::HookTiming { session_id, json } => {
+                commands::session::hook_timing(session_id.as_deref(), json)
+            }
         },
         Commands::Learn { action } => match action {
             LearnAction::Store { content, category } => commands::learn::store(&content, &category),
             LearnAction::Search { query, limit } => commands::learn::search(&query, limit),
-            LearnAction::Stats => commands::learn::stats(),
+            LearnAction::Stats { json } => commands::learn::stats(json),
             LearnAction::Trajectories {
                 session,
                 status,
@@ -592,6 +680,13 @@ fn main() {
             LearnAction::DownloadModel => commands::learn::download_model(),
             LearnAction::Clusters => commands::learn::clusters(),
             LearnAction::TuneClusters => commands::learn::tune_clusters(),
+            LearnAction::Patterns {
+                mine,
+                min_occurrences,
+            } => commands::learn::patterns(mine, min_occurrences),
+            LearnAction::Dependencies { file, limit } => {
+                commands::learn::dependencies(file.as_deref(), limit)
+            }
         },
         Commands::Agent { action } => match action {
             AgentAction::List => commands::agent::list(),
@@ -622,19 +717,22 @@ fn main() {
                 parent.as_deref(),
                 priority,
             ),
-            WorkAction::List { status, r#type } => {
-                commands::work::list(status.as_deref(), r#type.as_deref())
+            WorkAction::List { status, r#type, json } => {
+                commands::work::list(status.as_deref(), r#type.as_deref(), json)
             }
             WorkAction::Update { id, status } => commands::work::update(&id, &status),
             WorkAction::Close { id } => commands::work::close(&id),
             WorkAction::Sync => commands::work::sync(),
-            WorkAction::Status => commands::work::status(),
+            WorkAction::Status { json } => commands::work::status(json),
             WorkAction::Log { limit, since } => commands::work::log(limit, since.as_deref()),
             WorkAction::Claim { id } => commands::work::claim(&id),
             WorkAction::Release { id } => commands::work::release(&id),
             WorkAction::Stealable => commands::work::stealable(),
             WorkAction::Steal { id } => commands::work::steal(id.as_deref()),
             WorkAction::Load => commands::work::load(),
+            WorkAction::Heartbeat { id } => commands::work::heartbeat(id.as_deref()),
+            WorkAction::Get { id, json } => commands::work::get(&id, json),
+            WorkAction::Delete { id } => commands::work::delete(&id),
         },
         Commands::Mailbox { action } => match action {
             MailboxAction::Send {
@@ -649,6 +747,11 @@ fn main() {
                 limit,
             } => commands::mailbox::history(&work_item_id, limit),
             MailboxAction::Agents { work_item_id } => commands::mailbox::agents(&work_item_id),
+        },
+        Commands::Error { action } => match action {
+            ErrorAction::List { limit } => commands::error::list(limit),
+            ErrorAction::Find { error_text } => commands::error::find(&error_text),
+            ErrorAction::Stats => commands::error::stats(),
         },
         Commands::Guidance { action } => match action {
             GuidanceAction::Rules => commands::guidance::rules(),

@@ -25,7 +25,7 @@ pub fn list(config: &FlowForgeConfig) -> flowforge_core::Result<Value> {
 }
 
 pub fn info(config: &FlowForgeConfig, p: &Value) -> flowforge_core::Result<Value> {
-    let name = p.str_or("name", "");
+    let name = p.require_str("name")?;
     let plugins = flowforge_core::plugin::load_all_plugins(&config.plugins)?;
     match plugins.iter().find(|p| p.manifest.plugin.name == name) {
         Some(p) => {

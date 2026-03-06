@@ -26,6 +26,8 @@ pub fn run_safe(
         return Ok(());
     }
 
+    let start = std::time::Instant::now();
+
     let succeeded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
@@ -45,6 +47,10 @@ pub fn run_safe(
         }
     };
 
+    // Record hook timing metrics (best-effort, never fail)
+    let elapsed_ms = start.elapsed().as_millis() as f64;
+    record_hook_timing(hook_name, elapsed_ms, succeeded);
+
     // If the hook failed without producing output, emit a valid empty response
     // so Claude Code doesn't report "hook error" from missing stdout.
     if !succeeded {
@@ -52,6 +58,31 @@ pub fn run_safe(
     }
 
     Ok(())
+}
+
+/// Record hook execution timing as session metrics.
+/// Best-effort: never fails or blocks the hook pipeline.
+fn record_hook_timing(hook_name: &str, elapsed_ms: f64, succeeded: bool) {
+    let config = match FlowForgeConfig::load(&FlowForgeConfig::config_path()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let db_path = config.db_path();
+    let db = match db_path.exists().then(|| MemoryDb::open(&db_path).ok()).flatten() {
+        Some(d) => d,
+        None => return,
+    };
+    let session_id = match db.get_current_session().ok().flatten() {
+        Some(s) => s.id,
+        None => return,
+    };
+
+    let metric = format!("hook_ms:{}", hook_name);
+    let _ = db.increment_session_metric(&session_id, &metric, elapsed_ms);
+    let _ = db.increment_session_metric(&session_id, &format!("hook_calls:{}", hook_name), 1.0);
+    if !succeeded {
+        let _ = db.increment_session_metric(&session_id, &format!("hook_errors:{}", hook_name), 1.0);
+    }
 }
 
 fn log_hook_error(hook_name: &str, msg: &str) {
@@ -182,7 +213,7 @@ impl HookContext {
         // Fall back to any in-progress item
         let found = self.with_db("find_active_work_item", |db| {
             let filter = flowforge_core::WorkFilter {
-                status: Some("in_progress".to_string()),
+                status: Some(flowforge_core::WorkStatus::InProgress),
                 ..Default::default()
             };
             let items = db.list_work_items(&filter)?;
@@ -203,6 +234,164 @@ impl HookContext {
             } else {
                 db.record_routing_failure(task_desc, agent)
             }
+        });
+    }
+}
+
+/// Shared session cleanup logic: trajectory judgment, pattern consolidation,
+/// routing feedback, file co-edits. Called from both session_end and stop hooks.
+pub fn run_session_learning(ctx: &HookContext, session: &flowforge_core::SessionInfo) {
+    let sid = session.id.clone();
+
+    // Trajectory judgment
+    ctx.with_db("trajectory_judgment", |db| {
+        let trajectory = match db.get_active_trajectory(&sid)? {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        use flowforge_core::trajectory::TrajectoryStatus;
+        db.end_trajectory(&trajectory.id, TrajectoryStatus::Completed)?;
+
+        use flowforge_memory::trajectory::TrajectoryJudge;
+        let judge = TrajectoryJudge::new(db, &ctx.config.patterns);
+        let result = match judge.judge(&trajectory.id) {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
+
+        if result.verdict == flowforge_core::trajectory::TrajectoryVerdict::Success {
+            let _ = judge.distill(&trajectory.id);
+        }
+
+        // Auto-detect error resolutions from trajectory steps
+        let _ = db.auto_detect_resolutions(&sid, &trajectory.id);
+
+        // Effectiveness feedback: routing accuracy + pattern confidence
+        if let Ok(injections) = db.get_injections_for_session(&sid) {
+            for inj in injections.iter().filter(|i| i.injection_type == "routing") {
+                let hit = trajectory
+                    .agent_name
+                    .as_ref()
+                    .map(|a| a.eq_ignore_ascii_case(&inj.reference_id))
+                    .unwrap_or(false);
+                let _ =
+                    db.set_meta(&format!("routing_hit:{}", sid), if hit { "1" } else { "0" });
+            }
+
+            use flowforge_core::trajectory::TrajectoryVerdict;
+            let store = flowforge_memory::PatternStore::new(db, &ctx.config.patterns);
+            match result.verdict {
+                TrajectoryVerdict::Success => {
+                    for inj in injections.iter().filter(|i| i.injection_type == "pattern") {
+                        let _ = store.record_feedback(&inj.reference_id, true);
+                    }
+                }
+                TrajectoryVerdict::Failure => {
+                    for inj in injections.iter().filter(|i| i.injection_type == "pattern") {
+                        let _ = store.record_feedback(&inj.reference_id, false);
+                    }
+                }
+                TrajectoryVerdict::Partial => {}
+            }
+        }
+
+        // Auto-rate context injections
+        {
+            use flowforge_core::trajectory::TrajectoryVerdict;
+            let rating = match result.verdict {
+                TrajectoryVerdict::Success => "correlated_success",
+                TrajectoryVerdict::Failure => "correlated_failure",
+                TrajectoryVerdict::Partial => "correlated_partial",
+            };
+            let _ = db.rate_session_injections(&sid, rating);
+        }
+
+        // Feed verdict back to routing weights
+        if let (Some(ref agent_name), Some(ref task_desc)) =
+            (&trajectory.agent_name, &trajectory.task_description)
+        {
+            let pattern = extract_task_pattern(task_desc);
+            if !pattern.is_empty() {
+                use flowforge_core::trajectory::TrajectoryVerdict;
+                match result.verdict {
+                    TrajectoryVerdict::Success => {
+                        let _ = db.record_routing_success(&pattern, agent_name);
+                    }
+                    TrajectoryVerdict::Failure => {
+                        let _ = db.record_routing_failure(&pattern, agent_name);
+                    }
+                    TrajectoryVerdict::Partial => {}
+                }
+                let config_for_embed = flowforge_core::config::PatternsConfig::default();
+                let embedding = flowforge_memory::default_embedder(&config_for_embed);
+                let vec = embedding.embed(&pattern);
+                let source_id = format!("{}::{}", pattern, agent_name);
+                let _ = db.store_vector("routing", &source_id, &vec);
+            }
+        }
+
+        let _ = judge.consolidate();
+        Ok(())
+    });
+
+    // Pattern consolidation
+    if ctx.config.hooks.learning {
+        ctx.with_db("pattern_consolidation", |db| {
+            db.with_transaction(|| {
+                let store = flowforge_memory::PatternStore::new(db, &ctx.config.patterns);
+                store.consolidate()
+            })
+        });
+
+        // Record file co-edit pairs
+        let sid2 = session.id.clone();
+        ctx.with_db("record_file_co_edits", |db| {
+            db.record_file_co_edits(&sid2).map(|_| ())
+        });
+
+        // Retention pruning: remove old data from append-only tables
+        let retention_days = ctx.config.memory.retention_days;
+        if retention_days > 0 {
+            ctx.with_db("retention_pruning", |db| {
+                db.prune_old_data(retention_days).map(|_| ())
+            });
+        }
+
+        // Self-tuning: analyze pattern injection effectiveness across sessions
+        // and auto-adjust the similarity threshold if data warrants it
+        ctx.with_db("self_tune_injection_threshold", |db| {
+            let stats = db.get_injection_effectiveness_stats("pattern")?;
+            let mut successes = 0u64;
+            let mut failures = 0u64;
+            for (rating, count) in &stats {
+                match rating.as_str() {
+                    "correlated_success" => successes += count,
+                    "correlated_failure" => failures += count,
+                    _ => {}
+                }
+            }
+            let total = successes + failures;
+            if total < 20 {
+                return Ok(()); // Not enough data to tune
+            }
+            let success_rate = successes as f64 / total as f64;
+
+            // If pattern injections are mostly failing, raise the similarity threshold
+            // If they're succeeding well, lower it slightly to capture more matches
+            let current = ctx.config.patterns.min_injection_similarity;
+            let adjusted = if success_rate < 0.4 {
+                (current + 0.05).min(0.85) // Tighten: fewer, higher-quality injections
+            } else if success_rate > 0.75 {
+                (current - 0.02).max(0.30) // Loosen: capture more matches
+            } else {
+                return Ok(()); // In sweet spot, no change needed
+            };
+
+            if (adjusted - current).abs() > 0.001 {
+                db.set_meta("tuned_min_injection_similarity", &adjusted.to_string())?;
+            }
+            Ok(())
         });
     }
 }
@@ -437,7 +626,7 @@ mod tests {
             item_type: "task".to_string(),
             title: "Test task".to_string(),
             description: None,
-            status: "in_progress".to_string(),
+            status: flowforge_core::WorkStatus::InProgress,
             assignee: None,
             parent_id: None,
             priority: 2,
@@ -465,7 +654,7 @@ mod tests {
         // Look up the work item (simulating what the fixed subagent hooks do)
         let work_item_id = ctx.with_db("find_active_work_item", |db| {
             let filter = WorkFilter {
-                status: Some("in_progress".to_string()),
+                status: Some(flowforge_core::WorkStatus::InProgress),
                 ..Default::default()
             };
             let items = db.list_work_items(&filter)?;
@@ -501,7 +690,7 @@ mod tests {
             item_type: "task".to_string(),
             title: "Implement dark mode".to_string(),
             description: None,
-            status: "in_progress".to_string(),
+            status: flowforge_core::WorkStatus::InProgress,
             assignee: None,
             parent_id: None,
             priority: 2,
@@ -549,7 +738,7 @@ mod tests {
             item_type: "task".to_string(),
             title: "Some other task".to_string(),
             description: None,
-            status: "in_progress".to_string(),
+            status: flowforge_core::WorkStatus::InProgress,
             assignee: None,
             parent_id: None,
             priority: 2,
@@ -628,7 +817,7 @@ mod tests {
         // No work items in DB — lookup returns None, so no event is recorded
         let work_item_id = ctx.with_db("find_active_work_item", |db| {
             let filter = flowforge_core::WorkFilter {
-                status: Some("in_progress".to_string()),
+                status: Some(flowforge_core::WorkStatus::InProgress),
                 ..Default::default()
             };
             let items = db.list_work_items(&filter)?;

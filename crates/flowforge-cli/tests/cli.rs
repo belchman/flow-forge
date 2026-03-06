@@ -171,7 +171,7 @@ fn test_statusline_empty_stdin() {
         .write_stdin("{}")
         .assert()
         .success()
-        .stdout(predicate::str::contains("FlowForge"));
+        .stdout(predicate::str::contains("proven"));
 }
 
 #[test]
@@ -193,9 +193,8 @@ fn test_statusline_legend() {
         .success()
         .stdout(predicate::str::contains("Dashboard Legend"))
         .stdout(predicate::str::contains("HEADER LINE"))
-        .stdout(predicate::str::contains("LEARN LINE"))
-        .stdout(predicate::str::contains("SWARM LINE"))
-        .stdout(predicate::str::contains("DEBUG LINE"));
+        .stdout(predicate::str::contains("INTELLIGENCE + SESSION LINE"))
+        .stdout(predicate::str::contains("WORK + AGENTS LINE"));
 }
 
 // ── Session subcommands ──
@@ -221,7 +220,10 @@ fn test_session_checkpoints_no_session() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("No checkpoints") || stderr.contains("No active session"),
+        stdout.contains("No checkpoints")
+            || stderr.contains("No active session")
+            || stdout.contains("Name") // checkpoint table header (auto-checkpoints may exist)
+            || stdout.contains("auto:"),
         "Expected session-related message, got stdout={stdout:?} stderr={stderr:?}"
     );
 }
@@ -780,7 +782,7 @@ fn test_task_to_work_item_mapping() {
         item_type: "task".to_string(),
         title: "Fix authentication bug".to_string(),
         description: None,
-        status: "in_progress".to_string(),
+        status: flowforge_core::WorkStatus::InProgress,
         assignee: None,
         parent_id: None,
         priority: 2,
@@ -805,7 +807,7 @@ fn test_task_to_work_item_mapping() {
         item_type: "task".to_string(),
         title: "Add dark mode support".to_string(),
         description: None,
-        status: "in_progress".to_string(),
+        status: flowforge_core::WorkStatus::InProgress,
         assignee: None,
         parent_id: None,
         priority: 2,
@@ -839,14 +841,14 @@ fn test_task_to_work_item_mapping() {
     assert!(found.is_none()); // title lookup returns None
                               // Fallback: find any in-progress item
     let filter = flowforge_core::WorkFilter {
-        status: Some("in_progress".to_string()),
+        status: Some(flowforge_core::WorkStatus::InProgress),
         ..Default::default()
     };
     let in_progress = db.list_work_items(&filter).unwrap();
     assert_eq!(in_progress.len(), 2); // both items are in_progress
 
     // Case 4: Completed items are excluded from title match
-    db.update_work_item_status("kanbus-abc123", "completed")
+    db.update_work_item_status("kanbus-abc123", flowforge_core::WorkStatus::Completed)
         .unwrap();
     let found = db.get_work_item_by_title("Fix authentication bug").unwrap();
     assert!(found.is_none()); // completed → not returned

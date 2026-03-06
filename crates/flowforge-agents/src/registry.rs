@@ -124,9 +124,11 @@ impl AgentRegistry {
         self.agents.get(name)
     }
 
-    /// List all registered agents.
+    /// List all registered agents, sorted by name.
     pub fn list(&self) -> Vec<&AgentDef> {
-        self.agents.values().collect()
+        let mut agents: Vec<&AgentDef> = self.agents.values().collect();
+        agents.sort_by(|a, b| a.name.cmp(&b.name));
+        agents
     }
 
     /// Search for agents matching a text query.

@@ -53,9 +53,9 @@ impl<'a> TrajectoryJudge<'a> {
         // Factor 2: Work item outcome (weight 0.3)
         let work_item_factor = if let Some(ref wi_id) = trajectory.work_item_id {
             if let Ok(Some(wi)) = self.db.get_work_item(wi_id) {
-                if wi.status == "completed" {
+                if wi.status == flowforge_core::WorkStatus::Completed {
                     1.0
-                } else if wi.status == "in_progress" {
+                } else if wi.status == flowforge_core::WorkStatus::InProgress {
                     0.5
                 } else {
                     0.2

@@ -31,18 +31,21 @@ pub(super) fn check_destructive(
         }
     }
 
-    // SQL injection patterns (only for Bash commands)
+    // SQL injection patterns (only for Bash commands, word-boundary aware)
     if tool_name == "Bash" {
         if let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
-            let cmd_lower = cmd.to_lowercase();
-            let sql_patterns = [
-                ("drop table", "SQL DROP TABLE detected"),
-                ("drop database", "SQL DROP DATABASE detected"),
-                ("delete from", "SQL DELETE FROM detected"),
-                ("truncate table", "SQL TRUNCATE TABLE detected"),
-            ];
-            for (pattern, desc) in &sql_patterns {
-                if cmd_lower.contains(pattern) {
+            use regex::Regex;
+            use std::sync::LazyLock;
+            static SQL_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+                vec![
+                    (Regex::new(r"(?i)\bdrop\s+table\b").unwrap(), "SQL DROP TABLE detected"),
+                    (Regex::new(r"(?i)\bdrop\s+database\b").unwrap(), "SQL DROP DATABASE detected"),
+                    (Regex::new(r"(?i)\bdelete\s+from\b").unwrap(), "SQL DELETE FROM detected"),
+                    (Regex::new(r"(?i)\btruncate\s+table\b").unwrap(), "SQL TRUNCATE TABLE detected"),
+                ]
+            });
+            for (regex, desc) in SQL_PATTERNS.iter() {
+                if regex.is_match(cmd) {
                     return Some((GateAction::Ask, format!("[destructive_ops] {desc}")));
                 }
             }
@@ -53,17 +56,46 @@ pub(super) fn check_destructive(
 }
 
 /// Check secrets detection gate.
+/// Scans only string-valued fields (not field names) to reduce false positives.
+/// Skips inputs larger than 10KB to avoid performance issues on large payloads.
 pub(super) fn check_secrets(tool_input: &Value) -> Option<(GateAction, String)> {
-    let input_str = tool_input.to_string();
-    for regex in SECRET_PATTERNS.iter() {
-        if regex.is_match(&input_str) {
-            return Some((
-                GateAction::Deny,
-                "[secrets] Potential secret/credential detected in tool input".to_string(),
-            ));
+    const MAX_SCAN_SIZE: usize = 10 * 1024; // 10KB
+
+    let strings = collect_string_values(tool_input);
+    for s in &strings {
+        if s.len() > MAX_SCAN_SIZE {
+            continue;
+        }
+        for regex in SECRET_PATTERNS.iter() {
+            if regex.is_match(s) {
+                return Some((
+                    GateAction::Deny,
+                    "[secrets] Potential secret/credential detected in tool input".to_string(),
+                ));
+            }
         }
     }
     None
+}
+
+/// Recursively collect all string values from a JSON value (ignoring keys).
+fn collect_string_values(value: &Value) -> Vec<&str> {
+    let mut result = Vec::new();
+    match value {
+        Value::String(s) => result.push(s.as_str()),
+        Value::Array(arr) => {
+            for v in arr {
+                result.extend(collect_string_values(v));
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                result.extend(collect_string_values(v));
+            }
+        }
+        _ => {}
+    }
+    result
 }
 
 /// Check file scope gate.

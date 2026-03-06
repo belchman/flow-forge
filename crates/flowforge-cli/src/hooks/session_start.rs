@@ -112,10 +112,39 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Session continuity: inject previous session context
+    if let Some(ref db) = ctx.db {
+        let cwd = input
+            .common
+            .cwd
+            .as_deref()
+            .unwrap_or(".");
+        if let Ok(Some(prev)) = db.get_previous_session_context(cwd) {
+            let mut prev_ctx = String::from("\n[FlowForge] Previous session:");
+            if let Some(ref task) = prev.task_description {
+                prev_ctx.push_str(&format!(" Task: {}", task));
+            }
+            if let Some(ref verdict) = prev.verdict {
+                prev_ctx.push_str(&format!(" ({})", verdict));
+            }
+            if prev.duration_minutes > 0 {
+                prev_ctx.push_str(&format!(
+                    "\n  Duration: {}m, {} edits, {} commands",
+                    prev.duration_minutes, prev.edits_count, prev.commands_count
+                ));
+            }
+            if !prev.files_modified.is_empty() {
+                let files: Vec<&str> = prev.files_modified.iter().take(5).map(|s| s.as_str()).collect();
+                prev_ctx.push_str(&format!("\n  Files: {}", files.join(", ")));
+            }
+            ready_msg.push_str(&prev_ctx);
+        }
+    }
+
     // Report active work items count at startup
     if let Some(active) = ctx.with_db("list_active_work_items", |db| {
         let filter = flowforge_core::WorkFilter {
-            status: Some("in_progress".to_string()),
+            status: Some(flowforge_core::WorkStatus::InProgress),
             ..Default::default()
         };
         db.list_work_items(&filter)

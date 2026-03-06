@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::sessions::TeamMemberState;
 
 /// Conversation message persisted from transcript
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationMessage {
     pub id: i64,
     pub session_id: String,

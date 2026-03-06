@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Short-term pattern
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShortTermPattern {
     pub id: String,
     pub content: String,
@@ -15,7 +15,7 @@ pub struct ShortTermPattern {
 }
 
 /// Long-term pattern (promoted from short-term)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LongTermPattern {
     pub id: String,
     pub content: String,

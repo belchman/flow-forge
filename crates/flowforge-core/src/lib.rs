@@ -14,6 +14,7 @@ pub use error::{Error, Result};
 pub use types::{
     // Agents
     AgentDef,
+    DiscoveredCapability,
     // Sessions
     AgentSession,
     AgentSessionStatus,
@@ -24,6 +25,11 @@ pub use types::{
     ContextInjection,
     ConversationMessage,
     EditRecord,
+    // Error Recovery
+    ErrorCategory,
+    ErrorFingerprint,
+    ErrorResolution,
+    PreviousSessionContext,
     // Guidance
     GateAction,
     GateDecision,
@@ -52,4 +58,5 @@ pub use types::{
     WorkEvent,
     WorkFilter,
     WorkItem,
+    WorkStatus,
 };

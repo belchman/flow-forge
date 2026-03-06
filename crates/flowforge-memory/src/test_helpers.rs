@@ -23,7 +23,7 @@ pub fn work_item(id: &str, title: &str) -> WorkItem {
         item_type: "task".to_string(),
         title: title.to_string(),
         description: None,
-        status: "pending".to_string(),
+        status: flowforge_core::WorkStatus::Pending,
         assignee: None,
         parent_id: None,
         priority: 2,

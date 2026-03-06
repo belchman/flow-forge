@@ -41,12 +41,22 @@ impl MemoryDb {
     }
 
     pub fn kv_list(&self, namespace: &str) -> Result<Vec<(String, String)>> {
+        self.kv_list_limited(namespace, usize::MAX)
+    }
+
+    pub fn kv_list_limited(
+        &self,
+        namespace: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT key, value FROM key_value WHERE namespace = ?1 ORDER BY key")
+            .prepare(
+                "SELECT key, value FROM key_value WHERE namespace = ?1 ORDER BY key LIMIT ?2",
+            )
             .sq()?;
         let rows = stmt
-            .query_map(params![namespace], |row| {
+            .query_map(params![namespace, limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .sq()?;

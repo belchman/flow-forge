@@ -76,24 +76,35 @@ impl MemoryDb {
         rows.collect::<std::result::Result<Vec<_>, _>>().sq()
     }
 
-    /// Get agent sessions recursively — direct children plus grandchildren
-    /// (agents spawned by team lead agents). This makes team sub-agents visible
-    /// in the parent session's statusline.
+    /// Get agent sessions recursively — traverses the full agent tree using
+    /// a recursive CTE, so it handles arbitrarily deep nesting (not just 2 levels).
     pub fn get_agent_sessions_recursive(
         &self,
         parent_session_id: &str,
     ) -> Result<Vec<AgentSession>> {
-        // Get direct children
-        let direct = self.get_agent_sessions(parent_session_id)?;
-        let mut all = direct.clone();
-        // Get grandchildren (agents spawned by team lead agents)
-        for agent in &direct {
-            if agent.ended_at.is_none() {
-                let children = self.get_agent_sessions(&agent.agent_id)?;
-                all.extend(children);
-            }
-        }
-        Ok(all)
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE agent_tree AS (
+                    SELECT id, parent_session_id, agent_id, agent_type, status,
+                           started_at, ended_at, edits, commands, task_id, transcript_path
+                    FROM agent_sessions WHERE parent_session_id = ?1
+                    UNION ALL
+                    SELECT a.id, a.parent_session_id, a.agent_id, a.agent_type, a.status,
+                           a.started_at, a.ended_at, a.edits, a.commands, a.task_id, a.transcript_path
+                    FROM agent_sessions a
+                    JOIN agent_tree t ON a.parent_session_id = t.agent_id
+                )
+                SELECT * FROM agent_tree
+                ORDER BY started_at DESC",
+            )
+            .sq()?;
+        let rows = stmt
+            .query_map(params![parent_session_id], |row| {
+                Ok(parse_agent_session_row(row))
+            })
+            .sq()?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().sq()
     }
 
     pub fn get_active_agent_sessions(&self) -> Result<Vec<AgentSession>> {

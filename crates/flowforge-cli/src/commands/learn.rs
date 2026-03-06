@@ -69,13 +69,43 @@ pub fn search(query: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn stats() -> Result<()> {
+pub fn stats(json: bool) -> Result<()> {
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
     let db = MemoryDb::open(&config.db_path())?;
 
     let short_count = db.count_patterns_short()?;
     let long_count = db.count_patterns_long()?;
     let weights_count = db.count_routing_weights()?;
+
+    if json {
+        let traj_counts = db.count_trajectories_by_status()?;
+        let cluster_count = db.get_all_clusters()?.len();
+        let outlier_count = db.count_outlier_vectors()?;
+        let (routing_hits, routing_total) = db.routing_accuracy_stats().unwrap_or((0, 0));
+        let (pattern_successes, pattern_total) = db.pattern_hit_rate().unwrap_or((0, 0));
+        let (with_conf, without_conf, with_count, without_count) =
+            db.context_effectiveness_stats().unwrap_or((0.0, 0.0, 0, 0));
+
+        let obj = serde_json::json!({
+            "short_term_patterns": short_count,
+            "short_term_max": config.patterns.short_term_max,
+            "long_term_patterns": long_count,
+            "long_term_max": config.patterns.long_term_max,
+            "routing_weights": weights_count,
+            "trajectories": traj_counts,
+            "clusters": cluster_count,
+            "outlier_vectors": outlier_count,
+            "routing_accuracy": { "hits": routing_hits, "total": routing_total },
+            "pattern_hit_rate": { "successes": pattern_successes, "total": pattern_total },
+            "context_effectiveness": {
+                "with_context": { "avg_confidence": with_conf, "count": with_count },
+                "without_context": { "avg_confidence": without_conf, "count": without_count },
+            },
+            "embedder": if config.patterns.semantic_embeddings { "semantic" } else { "hash" },
+        });
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
+        return Ok(());
+    }
 
     println!("{}", "Learning Statistics".bold());
     println!(
@@ -259,6 +289,60 @@ pub fn trajectory(id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn patterns(mine: bool, min_occurrences: u32) -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = MemoryDb::open(&config.db_path())?;
+
+    let patterns = db.list_failure_patterns()?;
+
+    if patterns.is_empty() && !mine {
+        println!("No failure patterns found.");
+        return Ok(());
+    }
+
+    if !patterns.is_empty() {
+        println!(
+            "{} ({} patterns)",
+            "Failure Patterns".bold(),
+            patterns.len()
+        );
+        for p in &patterns {
+            println!(
+                "  {} [{}]",
+                p.pattern_name.cyan(),
+                p.trigger_tools.dimmed()
+            );
+            println!("    {}", p.description);
+            println!("    Hint: {}", p.prevention_hint);
+            println!(
+                "    Occurrences: {}, Prevented: {}",
+                p.occurrence_count, p.prevented_count
+            );
+        }
+    }
+
+    if mine {
+        println!();
+        println!(
+            "{} (min_occurrences={})",
+            "Mining failure patterns from trajectories...".bold(),
+            min_occurrences
+        );
+        let mined = db.mine_failure_patterns(min_occurrences)?;
+
+        if mined.is_empty() {
+            println!("  No common failure sequences found.");
+        } else {
+            println!("  Found {} candidate sequences:", mined.len());
+            for (seq, count) in &mined {
+                println!("    {} ({}x)", seq.cyan(), count);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn download_model() -> Result<()> {
     #[cfg(feature = "semantic")]
     {
@@ -369,6 +453,57 @@ pub fn tune_clusters() -> Result<()> {
         )
         .dimmed()
     );
+
+    Ok(())
+}
+
+pub fn dependencies(file: Option<&str>, limit: usize) -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = MemoryDb::open(&config.db_path())?;
+
+    if let Some(file_path) = file {
+        let deps = db.get_related_files(file_path, limit)?;
+        if deps.is_empty() {
+            println!("No file dependencies found for '{}'", file_path);
+            return Ok(());
+        }
+
+        println!(
+            "{} for {}",
+            "File Dependencies".bold(),
+            file_path.cyan()
+        );
+        for dep in &deps {
+            let other = if dep.file_a == file_path {
+                &dep.file_b
+            } else {
+                &dep.file_a
+            };
+            println!(
+                "  {} ({}x co-edited, last: {})",
+                other, dep.co_edit_count, dep.last_seen
+            );
+        }
+    } else {
+        let deps = db.get_dependency_graph(1, limit)?;
+        if deps.is_empty() {
+            println!("No file dependencies recorded yet.");
+            println!("Dependencies are recorded at session end when files are edited together.");
+            return Ok(());
+        }
+
+        println!(
+            "{} ({} edges)",
+            "File Dependency Graph".bold(),
+            deps.len()
+        );
+        for dep in &deps {
+            println!(
+                "  {} <-> {} ({}x co-edited)",
+                dep.file_a, dep.file_b, dep.co_edit_count
+            );
+        }
+    }
 
     Ok(())
 }

@@ -6,7 +6,7 @@ pub mod claude_tasks;
 mod stealing;
 
 use crate::config::WorkTrackingConfig;
-use crate::types::{WorkEvent, WorkFilter, WorkItem};
+use crate::types::{WorkEvent, WorkFilter, WorkItem, WorkStatus};
 use crate::Result;
 
 use backends::resolve_backend;
@@ -25,13 +25,13 @@ pub trait WorkDb {
     fn create_work_item(&self, item: &WorkItem) -> Result<()>;
     fn get_work_item(&self, id: &str) -> Result<Option<WorkItem>>;
     fn get_work_item_by_external_id(&self, external_id: &str) -> Result<Option<WorkItem>>;
-    fn update_work_item_status(&self, id: &str, status: &str) -> Result<()>;
+    fn update_work_item_status(&self, id: &str, status: WorkStatus) -> Result<()>;
     fn update_work_item_assignee(&self, id: &str, assignee: &str) -> Result<()>;
     fn list_work_items(&self, filter: &WorkFilter) -> Result<Vec<WorkItem>>;
     fn update_work_item_backend(&self, id: &str, backend: &str) -> Result<()>;
     fn update_work_item_external_id(&self, id: &str, external_id: &str) -> Result<()>;
     fn delete_work_item(&self, id: &str) -> Result<()>;
-    fn count_work_items_by_status(&self, status: &str) -> Result<u64>;
+    fn count_work_items_by_status(&self, status: WorkStatus) -> Result<u64>;
     fn record_work_event(&self, event: &WorkEvent) -> Result<i64>;
     fn get_work_events(&self, work_item_id: &str, limit: usize) -> Result<Vec<WorkEvent>>;
     fn get_recent_work_events(&self, limit: usize) -> Result<Vec<WorkEvent>>;
@@ -53,22 +53,23 @@ pub trait WorkStealing: WorkDb {
 /// Valid transitions: pending→in_progress, in_progress→completed,
 /// in_progress→pending, completed→pending.
 /// Returns Ok(()) for valid transitions, Err for invalid ones.
-pub fn validate_status_transition(old_status: &str, new_status: &str) -> Result<()> {
+pub fn validate_status_transition(old_status: WorkStatus, new_status: WorkStatus) -> Result<()> {
+    use WorkStatus::*;
     let valid = matches!(
         (old_status, new_status),
-        ("pending", "in_progress")
-            | ("in_progress", "completed")
-            | ("in_progress", "pending")
-            | ("completed", "pending")
-            | ("pending", "blocked")
-            | ("blocked", "pending")
-            | ("blocked", "in_progress")
-            | ("in_progress", "blocked")
+        (Pending, InProgress)
+            | (InProgress, Completed)
+            | (InProgress, Pending)
+            | (Completed, Pending)
+            | (Pending, Blocked)
+            | (Blocked, Pending)
+            | (Blocked, InProgress)
+            | (InProgress, Blocked)
     );
     if valid || old_status == new_status {
         Ok(())
     } else {
-        Err(crate::Error::Config(format!(
+        Err(crate::Error::InvalidInput(format!(
             "invalid status transition: {old_status} → {new_status}"
         )))
     }
@@ -85,7 +86,7 @@ pub fn create_item(db: &dyn WorkDb, config: &WorkTrackingConfig, item: &WorkItem
     let event = WorkEvent {
         id: 0,
         work_item_id: item.id.clone(),
-        event_type: "created".to_string(),
+        event_type: "created".into(),
         old_value: None,
         new_value: Some(item.title.clone()),
         actor: Some("user".to_string()),
@@ -98,7 +99,7 @@ pub fn create_item(db: &dyn WorkDb, config: &WorkTrackingConfig, item: &WorkItem
     if let Some(b) = backend {
         let ext_id = b.create(item)?;
         if let Some(ref eid) = ext_id {
-            let _ = db.update_work_item_external_id(&item.id, eid);
+            db.update_work_item_external_id(&item.id, eid)?;
         }
         // Dual-write to Claude Tasks for visibility
         sync_to_claude_tasks(item, config)?;
@@ -114,28 +115,26 @@ pub fn update_status(
     db: &dyn WorkDb,
     config: &WorkTrackingConfig,
     id: &str,
-    new_status: &str,
+    new_status: WorkStatus,
     actor: &str,
 ) -> Result<()> {
     let old_item = db.get_work_item(id)?;
     let old_status = old_item
         .as_ref()
-        .map(|i| i.status.clone())
+        .map(|i| i.status)
         .unwrap_or_default();
 
-    // Validate the transition before applying
-    if !old_status.is_empty() {
-        validate_status_transition(&old_status, new_status)?;
-    }
+    validate_status_transition(old_status, new_status)?;
 
     db.update_work_item_status(id, new_status)?;
 
+    let status_str = new_status.to_string();
     let event = WorkEvent {
         id: 0,
         work_item_id: id.to_string(),
         event_type: "status_changed".to_string(),
-        old_value: Some(old_status),
-        new_value: Some(new_status.to_string()),
+        old_value: Some(old_status.to_string()),
+        new_value: Some(status_str.clone()),
         actor: Some(actor.to_string()),
         timestamp: chrono::Utc::now(),
     };
@@ -151,17 +150,19 @@ pub fn update_status(
                 // Add a comment recording the status change
                 let comment = format!(
                     "{} → {} (by {})",
-                    old_item.as_ref().map(|i| i.status.as_str()).unwrap_or("?"),
-                    new_status,
+                    old_item.as_ref().map(|i| i.status.to_string()).unwrap_or_else(|| "?".to_string()),
+                    status_str,
                     actor
                 );
-                let _ = b.add_comment(ext_id, "FlowForge", &comment);
+                if let Err(e) = b.add_comment(ext_id, "FlowForge", &comment) {
+                    eprintln!("[FlowForge] warning: failed to add backend comment: {e}");
+                }
             }
         }
         // Dual-write to Claude Tasks
-        sync_status_to_claude_tasks(id, new_status, config)?;
+        sync_status_to_claude_tasks(id, &status_str, config)?;
     } else if backend_name == "claude_tasks" {
-        sync_status_to_claude_tasks(id, new_status, config)?;
+        sync_status_to_claude_tasks(id, &status_str, config)?;
     }
 
     Ok(())
@@ -174,7 +175,7 @@ pub fn close_item(
     id: &str,
     actor: &str,
 ) -> Result<()> {
-    update_status(db, config, id, "completed", actor)
+    update_status(db, config, id, WorkStatus::Completed, actor)
 }
 
 /// List work items with optional filter.
@@ -217,11 +218,11 @@ pub fn get_or_create_from_claude_task(
     let items = db.list_work_items(&filter)?;
     if let Some(existing) = items
         .iter()
-        .find(|i| i.title == subject && i.status != "completed")
+        .find(|i| i.title == subject && i.status != WorkStatus::Completed)
     {
         // Link the external_id if we have one and it's not set
         if let (Some(ext_id), None) = (claude_task_id, &existing.external_id) {
-            let _ = db.update_work_item_external_id(&existing.id, ext_id);
+            db.update_work_item_external_id(&existing.id, ext_id)?;
         }
         return Ok(existing.id.clone());
     }
@@ -235,7 +236,7 @@ pub fn get_or_create_from_claude_task(
         item_type: "task".to_string(),
         title: subject.to_string(),
         description: description.map(String::from),
-        status: "pending".to_string(),
+        status: WorkStatus::Pending,
         assignee: None,
         parent_id: None,
         priority: 2,
@@ -277,9 +278,11 @@ pub fn push_to_backend(db: &dyn WorkDb, config: &WorkTrackingConfig) -> Result<u
             match b.create(item) {
                 Ok(ext_id) => {
                     if let Some(ref eid) = ext_id {
-                        let _ = db.update_work_item_external_id(&item.id, eid);
+                        db.update_work_item_external_id(&item.id, eid)?;
                     }
-                    let _ = sync_to_claude_tasks(item, config);
+                    if let Err(e) = sync_to_claude_tasks(item, config) {
+                        eprintln!("[FlowForge] warning: Claude Tasks dual-write failed: {e}");
+                    }
                     true
                 }
                 Err(_) => false,
@@ -291,7 +294,7 @@ pub fn push_to_backend(db: &dyn WorkDb, config: &WorkTrackingConfig) -> Result<u
         };
 
         if ok {
-            let _ = db.update_work_item_backend(&item.id, backend_name);
+            db.update_work_item_backend(&item.id, backend_name)?;
             pushed += 1;
         }
     }
@@ -385,20 +388,22 @@ mod tests {
 
     #[test]
     fn test_valid_status_transitions() {
-        assert!(validate_status_transition("pending", "in_progress").is_ok());
-        assert!(validate_status_transition("in_progress", "completed").is_ok());
-        assert!(validate_status_transition("in_progress", "pending").is_ok());
-        assert!(validate_status_transition("completed", "pending").is_ok());
-        assert!(validate_status_transition("pending", "blocked").is_ok());
-        assert!(validate_status_transition("blocked", "in_progress").is_ok());
+        use crate::types::WorkStatus::*;
+        assert!(validate_status_transition(Pending, InProgress).is_ok());
+        assert!(validate_status_transition(InProgress, Completed).is_ok());
+        assert!(validate_status_transition(InProgress, Pending).is_ok());
+        assert!(validate_status_transition(Completed, Pending).is_ok());
+        assert!(validate_status_transition(Pending, Blocked).is_ok());
+        assert!(validate_status_transition(Blocked, InProgress).is_ok());
         // Same status is a no-op, should succeed
-        assert!(validate_status_transition("pending", "pending").is_ok());
+        assert!(validate_status_transition(Pending, Pending).is_ok());
     }
 
     #[test]
     fn test_invalid_status_transitions() {
-        assert!(validate_status_transition("completed", "in_progress").is_err());
-        assert!(validate_status_transition("pending", "completed").is_err());
+        use crate::types::WorkStatus::*;
+        assert!(validate_status_transition(Completed, InProgress).is_err());
+        assert!(validate_status_transition(Pending, Completed).is_err());
     }
 
     #[test]

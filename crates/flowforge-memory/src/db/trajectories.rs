@@ -235,6 +235,31 @@ impl MemoryDb {
         Ok(successes as f64 / total as f64)
     }
 
+    /// Get the last N tool names from a trajectory, in chronological order.
+    /// Efficient: only fetches tool_name column with LIMIT.
+    pub fn get_recent_trajectory_tools(
+        &self,
+        trajectory_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT tool_name FROM (
+                     SELECT tool_name, step_index
+                     FROM trajectory_steps
+                     WHERE trajectory_id = ?1
+                     ORDER BY step_index DESC
+                     LIMIT ?2
+                 ) sub ORDER BY step_index ASC",
+            )
+            .sq()?;
+        let rows = stmt
+            .query_map(params![trajectory_id, limit as i64], |row| row.get(0))
+            .sq()?;
+        rows.collect::<std::result::Result<Vec<String>, _>>().sq()
+    }
+
     pub fn trajectory_tool_sequence(&self, trajectory_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -272,5 +297,142 @@ impl MemoryDb {
             })
             .sq()?;
         rows.collect::<std::result::Result<Vec<_>, _>>().sq()
+    }
+    /// Find trajectories with similar task descriptions for cross-session knowledge transfer.
+    pub fn find_similar_trajectories(
+        &self,
+        keywords: &[&str],
+        limit: usize,
+    ) -> Result<Vec<flowforge_core::trajectory::TrajectoryInsight>> {
+        use flowforge_core::trajectory::TrajectoryInsight;
+
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build a LIKE query for keyword matching
+        let conditions: Vec<String> = keywords
+            .iter()
+            .map(|kw| format!("t.task_description LIKE '%{}%'", kw.replace('\'', "''")))
+            .collect();
+        let where_clause = conditions.join(" OR ");
+
+        let sql = format!(
+            "SELECT t.task_description, t.agent_name, t.verdict, t.confidence,
+                    (SELECT COUNT(*) FROM trajectory_steps ts WHERE ts.trajectory_id = t.id) as step_count,
+                    CASE WHEN t.verdict = 'success' THEN 1.0 ELSE 0.0 END as success_rate
+             FROM trajectories t
+             WHERE t.task_description IS NOT NULL
+               AND t.status IN ('completed', 'judged')
+               AND ({where_clause})
+             ORDER BY t.ended_at DESC
+             LIMIT ?1"
+        );
+
+        let mut stmt = self.conn.prepare(&sql).sq()?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(TrajectoryInsight {
+                    task_description: row.get(0)?,
+                    agent_name: row.get(1)?,
+                    verdict: row.get(2)?,
+                    confidence: row.get::<_, f64>(3).unwrap_or(0.0),
+                    total_steps: row.get::<_, i64>(4).unwrap_or(0) as u64,
+                    success_rate: row.get::<_, f64>(5).unwrap_or(0.0),
+                })
+            })
+            .sq()?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.sq()?);
+        }
+        Ok(results)
+    }}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowforge_core::trajectory::{StepOutcome, Trajectory, TrajectoryStatus};
+    use std::path::Path;
+
+    fn test_db() -> MemoryDb {
+        MemoryDb::open(Path::new(":memory:")).unwrap()
+    }
+
+    fn setup_session_and_trajectory(db: &MemoryDb) -> (String, String) {
+        let session = flowforge_core::SessionInfo {
+            id: "sess-1".to_string(),
+            started_at: Utc::now(),
+            ended_at: None,
+            cwd: "/tmp".to_string(),
+            edits: 0,
+            commands: 0,
+            summary: None,
+            transcript_path: None,
+        };
+        db.create_session(&session).unwrap();
+
+        let traj = Trajectory {
+            id: "traj-1".to_string(),
+            session_id: "sess-1".to_string(),
+            work_item_id: None,
+            agent_name: None,
+            task_description: Some("Test task".to_string()),
+            status: TrajectoryStatus::Recording,
+            started_at: Utc::now(),
+            ended_at: None,
+            verdict: None,
+            confidence: None,
+            metadata: None,
+            embedding_id: None,
+        };
+        db.create_trajectory(&traj).unwrap();
+        ("sess-1".to_string(), "traj-1".to_string())
+    }
+
+    #[test]
+    fn test_get_recent_trajectory_tools_empty() {
+        let db = test_db();
+        let (_sid, tid) = setup_session_and_trajectory(&db);
+        let tools = db.get_recent_trajectory_tools(&tid, 5).unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_get_recent_trajectory_tools_returns_chronological() {
+        let db = test_db();
+        let (_sid, tid) = setup_session_and_trajectory(&db);
+
+        // Record 7 steps
+        for (i, tool) in ["Read", "Glob", "Edit", "Bash", "Write", "Grep", "Read"]
+            .iter()
+            .enumerate()
+        {
+            db.record_trajectory_step(&tid, tool, None, StepOutcome::Success, None)
+                .unwrap();
+            // Ensure distinct step_index by using the auto-increment
+            let _ = i;
+        }
+
+        // Get last 5 — should be Edit, Bash, Write, Grep, Read (chronological)
+        let recent = db.get_recent_trajectory_tools(&tid, 5).unwrap();
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent, vec!["Edit", "Bash", "Write", "Grep", "Read"]);
+    }
+
+    #[test]
+    fn test_get_recent_trajectory_tools_limit_larger_than_steps() {
+        let db = test_db();
+        let (_sid, tid) = setup_session_and_trajectory(&db);
+
+        db.record_trajectory_step(&tid, "Read", None, StepOutcome::Success, None)
+            .unwrap();
+        db.record_trajectory_step(&tid, "Edit", None, StepOutcome::Success, None)
+            .unwrap();
+
+        let recent = db.get_recent_trajectory_tools(&tid, 10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent, vec!["Read", "Edit"]);
     }
 }

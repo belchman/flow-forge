@@ -1,21 +1,13 @@
 {
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
   "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "flowforge hook session-start",
-            "timeout": 3000,
-            "type": "command"
-          }
-        ]
-      }
-    ],
     "Notification": [
       {
         "hooks": [
           {
-            "command": "flowforge hook notification",
+            "command": "/Users/matt/.cargo/bin/flowforge hook notification",
             "timeout": 3000,
             "type": "command"
           }
@@ -26,7 +18,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook post-tool-use",
+            "command": "/Users/matt/.cargo/bin/flowforge hook post-tool-use",
             "timeout": 3000,
             "type": "command"
           }
@@ -37,7 +29,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook post-tool-use-failure",
+            "command": "/Users/matt/.cargo/bin/flowforge hook post-tool-use-failure",
             "timeout": 3000,
             "type": "command"
           }
@@ -48,7 +40,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook pre-compact",
+            "command": "/Users/matt/.cargo/bin/flowforge hook pre-compact",
             "type": "command"
           }
         ]
@@ -58,7 +50,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook pre-tool-use",
+            "command": "/Users/matt/.cargo/bin/flowforge hook pre-tool-use",
             "timeout": 3000,
             "type": "command"
           }
@@ -69,7 +61,18 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook session-end",
+            "command": "/Users/matt/.cargo/bin/flowforge hook session-end",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/matt/.cargo/bin/flowforge hook session-start",
+            "timeout": 10000,
             "type": "command"
           }
         ]
@@ -79,7 +82,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook stop",
+            "command": "/Users/matt/.cargo/bin/flowforge hook stop",
             "type": "command"
           }
         ]
@@ -89,7 +92,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook subagent-start",
+            "command": "/Users/matt/.cargo/bin/flowforge hook subagent-start",
             "type": "command"
           }
         ]
@@ -99,7 +102,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook subagent-stop",
+            "command": "/Users/matt/.cargo/bin/flowforge hook subagent-stop",
             "type": "command"
           }
         ]
@@ -109,7 +112,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook task-completed",
+            "command": "/Users/matt/.cargo/bin/flowforge hook task-completed",
             "type": "command"
           }
         ]
@@ -119,7 +122,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook teammate-idle",
+            "command": "/Users/matt/.cargo/bin/flowforge hook teammate-idle",
             "type": "command"
           }
         ]
@@ -129,7 +132,7 @@
       {
         "hooks": [
           {
-            "command": "flowforge hook user-prompt-submit",
+            "command": "/Users/matt/.cargo/bin/flowforge hook user-prompt-submit",
             "timeout": 5000,
             "type": "command"
           }
@@ -138,7 +141,7 @@
     ]
   },
   "statusLine": {
-    "command": "flowforge statusline",
+    "command": "/Users/matt/.cargo/bin/flowforge statusline",
     "type": "command"
   }
 }

@@ -77,6 +77,9 @@ pub struct MemoryConfig {
     /// Embedding vector dimensionality. Must match the model (AllMiniLM-L6-v2 = 128 after PCA).
     /// Default: 128. Changing this requires rebuilding the index.
     pub embedding_dim: usize,
+    /// Days to retain append-only data (gate decisions, work events, edits, etc.).
+    /// Set to 0 to disable pruning. Default: 90.
+    pub retention_days: u64,
 }
 
 impl Default for MemoryConfig {
@@ -87,6 +90,7 @@ impl Default for MemoryConfig {
             hnsw_ef_construction: 100,
             hnsw_ef_search: 50,
             embedding_dim: 128,
+            retention_days: 90,
         }
     }
 }
@@ -487,13 +491,14 @@ pub struct PluginsConfig {
 impl FlowForgeConfig {
     /// Load config from a TOML file, falling back to defaults
     pub fn load(path: &Path) -> crate::Result<Self> {
-        if path.exists() {
+        let config = if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            let config: Self = toml::from_str(&content)?;
-            Ok(config)
+            toml::from_str(&content)?
         } else {
-            Ok(Self::default())
-        }
+            Self::default()
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Save config to a TOML file

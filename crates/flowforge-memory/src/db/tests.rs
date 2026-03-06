@@ -24,7 +24,7 @@ fn test_work_item(id: &str, title: &str) -> WorkItem {
         item_type: "task".to_string(),
         title: title.to_string(),
         description: None,
-        status: "pending".to_string(),
+        status: flowforge_core::WorkStatus::Pending,
         assignee: None,
         parent_id: None,
         priority: 2,
@@ -49,16 +49,16 @@ fn test_work_item_crud() {
     db.create_work_item(&item).unwrap();
     let fetched = db.get_work_item("wi-1").unwrap().unwrap();
     assert_eq!(fetched.title, "Fix login bug");
-    assert_eq!(fetched.status, "pending");
-    db.update_work_item_status("wi-1", "in_progress").unwrap();
+    assert_eq!(fetched.status, flowforge_core::WorkStatus::Pending);
+    db.update_work_item_status("wi-1", flowforge_core::WorkStatus::InProgress).unwrap();
     let updated = db.get_work_item("wi-1").unwrap().unwrap();
-    assert_eq!(updated.status, "in_progress");
+    assert_eq!(updated.status, flowforge_core::WorkStatus::InProgress);
     db.update_work_item_assignee("wi-1", "agent:coder").unwrap();
     let assigned = db.get_work_item("wi-1").unwrap().unwrap();
     assert_eq!(assigned.assignee, Some("agent:coder".to_string()));
-    db.update_work_item_status("wi-1", "completed").unwrap();
+    db.update_work_item_status("wi-1", flowforge_core::WorkStatus::Completed).unwrap();
     let completed = db.get_work_item("wi-1").unwrap().unwrap();
-    assert_eq!(completed.status, "completed");
+    assert_eq!(completed.status, flowforge_core::WorkStatus::Completed);
     assert!(completed.completed_at.is_some());
 }
 
@@ -96,18 +96,18 @@ fn test_work_item_list_filter() {
         .unwrap();
     db.create_work_item(&test_work_item("wi-b", "Task B"))
         .unwrap();
-    db.update_work_item_status("wi-b", "completed").unwrap();
+    db.update_work_item_status("wi-b", flowforge_core::WorkStatus::Completed).unwrap();
     let all = db.list_work_items(&WorkFilter::default()).unwrap();
     assert_eq!(all.len(), 2);
     let pending = db
         .list_work_items(&WorkFilter {
-            status: Some("pending".to_string()),
+            status: Some(flowforge_core::WorkStatus::Pending),
             ..Default::default()
         })
         .unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, "wi-a");
-    let count = db.count_work_items_by_status("completed").unwrap();
+    let count = db.count_work_items_by_status(flowforge_core::WorkStatus::Completed).unwrap();
     assert_eq!(count, 1);
 }
 
@@ -277,7 +277,7 @@ fn test_gate_decisions_asc_order() {
 
 fn create_stealable_item(db: &MemoryDb, id: &str, progress: i32, stale_mins: i64) {
     let mut item = test_work_item(id, &format!("Task {id}"));
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
     db.claim_work_item(id, "session-old").unwrap();
     let old_hb = (Utc::now() - chrono::Duration::minutes(stale_mins)).to_rfc3339();
@@ -293,7 +293,7 @@ fn create_stealable_item(db: &MemoryDb, id: &str, progress: i32, stale_mins: i64
 fn test_steal_work_item_safe() {
     let db = test_db();
     let mut item = test_work_item("ws-1", "Steal me");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
     db.claim_work_item("ws-1", "old-session").unwrap();
     db.conn
@@ -318,7 +318,7 @@ fn test_steal_work_item_safe() {
 fn test_steal_anti_thrashing() {
     let db = test_db();
     let mut item = test_work_item("ws-2", "Anti-thrash");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
     db.claim_work_item("ws-2", "s1").unwrap();
     db.conn
@@ -335,18 +335,18 @@ fn test_claim_load_aware() {
     let db = test_db();
     for i in 0..2 {
         let mut item = test_work_item(&format!("la-{i}"), &format!("Load {i}"));
-        item.status = "in_progress".to_string();
+        item.status = flowforge_core::WorkStatus::InProgress;
         db.create_work_item(&item).unwrap();
         db.claim_work_item(&format!("la-{i}"), "session-a").unwrap();
     }
     let mut item3 = test_work_item("la-2", "Load 2");
-    item3.status = "in_progress".to_string();
+    item3.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item3).unwrap();
     assert!(db
         .claim_work_item_load_aware("la-2", "session-a", 3)
         .unwrap());
     let mut item4 = test_work_item("la-3", "Load 3");
-    item4.status = "in_progress".to_string();
+    item4.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item4).unwrap();
     assert!(!db
         .claim_work_item_load_aware("la-3", "session-a", 3)
@@ -662,7 +662,7 @@ fn test_checkpoint_delete() {
 fn test_claim_already_claimed_item_fails() {
     let db = test_db();
     let mut item = test_work_item("ws-dup", "Claimed item");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
     assert!(db.claim_work_item("ws-dup", "session-1").unwrap());
     // second claim by different session should fail (item is not stealable)
@@ -673,7 +673,7 @@ fn test_claim_already_claimed_item_fails() {
 fn test_release_then_reclaim() {
     let db = test_db();
     let mut item = test_work_item("ws-rel", "Release me");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
     db.claim_work_item("ws-rel", "s1").unwrap();
     db.release_work_item("ws-rel").unwrap();
@@ -692,7 +692,7 @@ fn test_heartbeat_updates_all_claimed_items() {
     let db = test_db();
     for i in 0..3 {
         let mut item = test_work_item(&format!("hb-{i}"), &format!("HB task {i}"));
-        item.status = "in_progress".to_string();
+        item.status = flowforge_core::WorkStatus::InProgress;
         db.create_work_item(&item).unwrap();
         db.claim_work_item(&format!("hb-{i}"), "my-session")
             .unwrap();
@@ -715,7 +715,7 @@ fn test_progress_update() {
 fn test_steal_reclaim_cycle() {
     let db = test_db();
     let mut item = test_work_item("ws-cycle", "Steal cycle");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
     db.claim_work_item("ws-cycle", "s1").unwrap();
     // make stealable
@@ -740,7 +740,7 @@ fn test_mark_stale_items_respects_min_progress() {
     let db = test_db();
     // item with high progress should NOT be marked stealable
     let mut item = test_work_item("stale-hp", "High progress");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
     db.claim_work_item("stale-hp", "old-sess").unwrap();
     db.update_progress("stale-hp", 50).unwrap();
@@ -768,7 +768,7 @@ fn test_mark_stale_items_respects_min_progress() {
 fn test_auto_release_abandoned() {
     let db = test_db();
     let mut item = test_work_item("abandon-1", "Abandoned");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
     db.claim_work_item("abandon-1", "old-sess").unwrap();
     let very_old = (Utc::now() - chrono::Duration::minutes(120)).to_rfc3339();
@@ -782,7 +782,7 @@ fn test_auto_release_abandoned() {
     assert_eq!(released, 1);
     let item = db.get_work_item("abandon-1").unwrap().unwrap();
     assert!(item.claimed_by.is_none());
-    assert_eq!(item.status, "pending");
+    assert_eq!(item.status, flowforge_core::WorkStatus::Pending);
 }
 
 #[test]
@@ -792,7 +792,7 @@ fn test_get_session_load() {
     assert_eq!(db.get_session_load("empty-sess").unwrap(), 0);
     for i in 0..3 {
         let mut item = test_work_item(&format!("load-{i}"), &format!("Load {i}"));
-        item.status = "in_progress".to_string();
+        item.status = flowforge_core::WorkStatus::InProgress;
         db.create_work_item(&item).unwrap();
         db.claim_work_item(&format!("load-{i}"), "busy-sess")
             .unwrap();
@@ -804,7 +804,7 @@ fn test_get_session_load() {
 fn test_get_stealable_items() {
     let db = test_db();
     let mut item = test_work_item("stealable-1", "Ready to steal");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
     db.claim_work_item("stealable-1", "old-sess").unwrap();
     db.conn
@@ -1457,7 +1457,7 @@ fn test_helper_work_item_defaults() {
     let item = test_helpers::work_item("test-id", "Test Title");
     assert_eq!(item.id, "test-id");
     assert_eq!(item.title, "Test Title");
-    assert_eq!(item.status, "pending");
+    assert_eq!(item.status, flowforge_core::WorkStatus::Pending);
     assert_eq!(item.backend, "flowforge");
     assert_eq!(item.priority, 2);
     assert!(!item.stealable);
@@ -1537,8 +1537,8 @@ fn test_helpers_module_roundtrip() {
 }
 
 #[test]
-fn test_schema_version_is_7() {
-    assert_eq!(SCHEMA_VERSION, 7);
+fn test_schema_version_is_8() {
+    assert_eq!(SCHEMA_VERSION, 8);
 }
 
 #[test]
@@ -1793,12 +1793,12 @@ fn test_claim_work_item_load_aware_atomic() {
 
     // Create 2 work items, claim the first normally
     let mut item1 = test_work_item("wi-load-1", "Task 1");
-    item1.status = "in_progress".to_string();
+    item1.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item1).unwrap();
     db.claim_work_item("wi-load-1", "session-A").unwrap();
 
     let mut item2 = test_work_item("wi-load-2", "Task 2");
-    item2.status = "in_progress".to_string();
+    item2.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item2).unwrap();
 
     // With max_concurrent=1, session-A should NOT be able to claim a second item
@@ -1818,7 +1818,7 @@ fn test_claim_work_item_load_aware_atomic() {
 fn test_steal_work_item_preserves_high_progress() {
     let db = test_db();
     let mut item = test_work_item("wi-steal-prog", "High progress task");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     item.stealable = true;
     item.progress = 75;
     item.claimed_by = Some("old-session".to_string());
@@ -1838,7 +1838,7 @@ fn test_steal_work_item_preserves_high_progress() {
 fn test_steal_work_item_resets_low_progress() {
     let db = test_db();
     let mut item = test_work_item("wi-steal-low", "Low progress task");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     item.stealable = true;
     item.progress = 20;
     item.claimed_by = Some("old-session".to_string());
@@ -2082,7 +2082,7 @@ fn test_session_with_null_ended_at() {
 fn test_get_work_item_by_title_exact_match() {
     let db = test_db();
     let mut item = test_work_item("wi-title-1", "Fix authentication bug");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
 
     let found = db.get_work_item_by_title("Fix authentication bug").unwrap();
@@ -2105,11 +2105,11 @@ fn test_get_work_item_by_title_prefers_in_progress() {
     let db = test_db();
 
     let mut pending = test_work_item("wi-pending", "Deploy feature X");
-    pending.status = "pending".to_string();
+    pending.status = flowforge_core::WorkStatus::Pending;
     db.create_work_item(&pending).unwrap();
 
     let mut active = test_work_item("wi-active", "Deploy feature X");
-    active.status = "in_progress".to_string();
+    active.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&active).unwrap();
 
     let found = db.get_work_item_by_title("Deploy feature X").unwrap();
@@ -2121,7 +2121,7 @@ fn test_get_work_item_by_title_skips_completed() {
     let db = test_db();
 
     let mut completed = test_work_item("wi-done", "Refactor parser");
-    completed.status = "completed".to_string();
+    completed.status = flowforge_core::WorkStatus::Completed;
     db.create_work_item(&completed).unwrap();
 
     let found = db.get_work_item_by_title("Refactor parser").unwrap();
@@ -2371,7 +2371,7 @@ fn test_trajectory_fk_on_delete_set_null() {
 
     // Create a work item
     let mut item = test_work_item("wi-fk-test", "FK Test");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
 
     // Insert trajectory referencing the work item
@@ -2596,7 +2596,7 @@ fn test_get_agent_sessions_recursive_includes_grandchildren() {
 }
 
 #[test]
-fn test_get_agent_sessions_recursive_skips_ended_grandchildren() {
+fn test_get_agent_sessions_recursive_includes_all_descendants() {
     use flowforge_core::{AgentSession, AgentSessionStatus};
     let db = test_db();
 
@@ -2612,7 +2612,7 @@ fn test_get_agent_sessions_recursive_skips_ended_grandchildren() {
     };
     db.create_session(&session).unwrap();
 
-    // Ended team lead — should not recurse into its children
+    // Ended team lead
     let ended_lead = AgentSession {
         id: "agent-ended-lead".to_string(),
         parent_session_id: "sess-skip".to_string(),
@@ -2628,7 +2628,7 @@ fn test_get_agent_sessions_recursive_skips_ended_grandchildren() {
     };
     db.create_agent_session(&ended_lead).unwrap();
 
-    // Sub-agent of ended lead
+    // Sub-agent of ended lead — still active, should be visible
     let sub = AgentSession {
         id: "agent-hidden-sub".to_string(),
         parent_session_id: "ag-ended-lead".to_string(),
@@ -2644,11 +2644,13 @@ fn test_get_agent_sessions_recursive_skips_ended_grandchildren() {
     };
     db.create_agent_session(&sub).unwrap();
 
-    // Only the ended lead should appear (1 result), sub should NOT be included
-    // because we don't recurse into ended agents
+    // Recursive CTE returns ALL descendants regardless of parent status
+    // (sub-agents of ended leads may still be active and need visibility)
     let results = db.get_agent_sessions_recursive("sess-skip").unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].agent_id, "ag-ended-lead");
+    assert_eq!(results.len(), 2);
+    let agent_ids: Vec<&str> = results.iter().map(|a| a.agent_id.as_str()).collect();
+    assert!(agent_ids.contains(&"ag-ended-lead"));
+    assert!(agent_ids.contains(&"ag-hidden-sub"));
 }
 
 // ── get_or_create_from_claude_task tests ──
@@ -2729,7 +2731,7 @@ fn test_get_or_create_from_claude_task_deduplicates_by_title() {
 
     // Create a work item without external_id
     let mut item = test_work_item("wi-existing", "Deploy service Z");
-    item.status = "in_progress".to_string();
+    item.status = flowforge_core::WorkStatus::InProgress;
     db.create_work_item(&item).unwrap();
 
     // get_or_create with matching title → should return existing

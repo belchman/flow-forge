@@ -104,6 +104,41 @@ impl MemoryDb {
         Ok(())
     }
 
+    /// Batch-delete expired short-term patterns (created before threshold, low confidence).
+    pub fn batch_delete_expired_short_patterns(
+        &self,
+        threshold: &str,
+        min_confidence: f64,
+    ) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM patterns_short WHERE created_at < ?1 AND confidence < ?2",
+                params![threshold, min_confidence],
+            )
+            .sq()?;
+        Ok(count as u64)
+    }
+
+    /// Batch-delete vectors for expired short-term patterns.
+    pub fn batch_delete_expired_short_vectors(
+        &self,
+        threshold: &str,
+        min_confidence: f64,
+    ) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM hnsw_entries WHERE source_type = 'pattern_short'
+                 AND source_id IN (
+                     SELECT id FROM patterns_short WHERE created_at < ?1 AND confidence < ?2
+                 )",
+                params![threshold, min_confidence],
+            )
+            .sq()?;
+        Ok(count as u64)
+    }
+
     pub fn count_patterns_short(&self) -> Result<u64> {
         self.conn
             .query_row("SELECT COUNT(*) FROM patterns_short", [], |row| row.get(0))

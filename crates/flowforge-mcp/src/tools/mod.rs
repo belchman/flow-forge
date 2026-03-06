@@ -1,5 +1,7 @@
 mod agents;
 mod conversations;
+mod failure_patterns;
+mod file_dependencies;
 mod guidance;
 mod learning;
 mod mailbox;
@@ -9,6 +11,9 @@ mod sessions;
 mod team;
 mod trajectories;
 mod work;
+mod error_recovery;
+mod recovery_strategies;
+mod tool_metrics;
 mod work_stealing;
 
 use serde_json::{json, Value};
@@ -171,6 +176,40 @@ impl ToolRegistry {
             "trajectory_list" => self.use_db(|db, _, p| trajectories::list(db, p), params),
             "trajectory_get" => self.use_db(|db, _, p| trajectories::get(db, p), params),
             "trajectory_judge" => self.use_db(trajectories::judge, params),
+
+            // Failure patterns
+            "failure_patterns" => {
+                self.use_db(|db, _, p| failure_patterns::list(db, p), params)
+            }
+
+            // File dependencies
+            "file_dependencies" => {
+                self.use_db(|db, _, p| file_dependencies::list(db, p), params)
+            }
+
+            // Error recovery
+            "error_list" => self.use_db(|db, _, p| error_recovery::list(db, p), params),
+            "error_find" => self.use_db(|db, _, p| error_recovery::find(db, p), params),
+            "error_stats" => self.use_db(|db, _, _| error_recovery::stats(db), params),
+
+            // Recovery strategies
+            "recovery_strategies" => {
+                self.use_db(|db, _, p| recovery_strategies::list(db, p), params)
+            }
+
+            // Tool metrics
+            "tool_metrics" => self.use_db(|db, _, p| tool_metrics::list(db, p), params),
+            "tool_best_agents" => self.use_db(|db, _, p| tool_metrics::best(db, p), params),
+            "session_cost" => self.use_db(|db, _, p| tool_metrics::session_cost(db, p), params),
+
+            // Intelligence
+            "task_decomposition" => {
+                self.use_db(|db, _, p| task_decomposition(db, p), params)
+            }
+            "similar_trajectories" => {
+                self.use_db(|db, _, p| similar_trajectories(db, p), params)
+            }
+            "batching_insights" => self.use_db(|db, _, _| batching_insights(db), params),
 
             _ => json!({ "error": format!("unknown tool: {}", name) }),
         }
@@ -542,6 +581,77 @@ impl ToolRegistry {
         tools
             .tool("work_status", "Get work item counts by status")
             .build();
+
+        // Failure patterns
+        tools
+            .tool(
+                "failure_patterns",
+                "List known failure patterns and optionally mine new ones from failed trajectories",
+            )
+            .optional_bool("mine", "Also mine new patterns from failed trajectories")
+            .optional_int_default("min_occurrences", "Minimum occurrences to report when mining", 2)
+            .build();
+
+        // File dependencies
+        tools
+            .tool(
+                "file_dependencies",
+                "Show file co-edit dependency graph. When a file is specified, shows files commonly edited together with it. Without a file, shows the full dependency graph.",
+            )
+            .optional_str("file", "File path to show dependencies for (omit for full graph)")
+            .optional_int_default("limit", "Max results to return", 20)
+            .build();
+
+        // Error recovery
+        tools
+            .tool("error_list", "List known error fingerprints with occurrence counts")
+            .optional_int_default("limit", "Max results", 20)
+            .build();
+        tools
+            .tool("error_find", "Find resolutions for an error by text or fingerprint ID")
+            .optional_str("error_text", "Error text to search for")
+            .optional_str("fingerprint_id", "Error fingerprint ID")
+            .optional_int_default("limit", "Max resolutions", 5)
+            .build();
+        tools
+            .tool("error_stats", "Get error recovery statistics")
+            .build();
+
+        // Recovery strategies
+        tools
+            .tool("recovery_strategies", "Get recovery suggestions for guidance gate denials")
+            .optional_str("gate_name", "Filter by gate name")
+            .optional_str("trigger", "Filter by trigger pattern")
+            .build();
+
+        // Tool metrics
+        tools
+            .tool("tool_metrics", "List tool success/failure metrics")
+            .optional_str("agent_name", "Filter by agent name")
+            .build();
+        tools
+            .tool("tool_best_agents", "Get best agents for a specific tool")
+            .required_str("tool_name", "Tool name to find best agents for")
+            .optional_int_default("limit", "Max results", 5)
+            .build();
+        tools
+            .tool("session_cost", "Get session cost metrics (tool calls, bytes, errors)")
+            .optional_str("session_id", "Session ID (defaults to current)")
+            .build();
+
+        // Intelligence
+        tools
+            .tool("task_decomposition", "Predict subtasks and phases for a task based on historical trajectories")
+            .required_str("task", "Task description to decompose")
+            .build();
+        tools
+            .tool("similar_trajectories", "Find similar past trajectories for cross-session knowledge transfer")
+            .required_str("task", "Task description to find similar past work for")
+            .optional_int_default("limit", "Max results", 5)
+            .build();
+        tools
+            .tool("batching_insights", "Detect sequential tool calls that could be parallelized for efficiency")
+            .build();
     }
 }
 
@@ -574,6 +684,60 @@ impl ToolRegistry {
     }
 }
 
+// ── Intelligence tool handlers ─────────────────────────────────
+
+fn task_decomposition(db: &MemoryDb, params: &Value) -> flowforge_core::Result<Value> {
+    use crate::params::ParamExt;
+    let task = params.require_str("task")?;
+    let decomp = db.predict_decomposition(task)?;
+    Ok(json!({
+        "status": "ok",
+        "task": decomp.task,
+        "confidence": decomp.confidence,
+        "sample_count": decomp.sample_count,
+        "phases": decomp.phases.iter().map(|p| json!({
+            "name": p.name,
+            "tools": p.tools,
+            "suggested_agent": p.suggested_agent,
+            "estimated_steps": p.estimated_steps,
+            "confidence": p.confidence,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+fn similar_trajectories(db: &MemoryDb, params: &Value) -> flowforge_core::Result<Value> {
+    use crate::params::ParamExt;
+    let task = params.require_str("task")?;
+    let limit = params.u64_or("limit", 5) as usize;
+    let keywords: Vec<&str> = task.split_whitespace().filter(|w| w.len() > 3).collect();
+    let insights = db.find_similar_trajectories(&keywords, limit)?;
+    Ok(json!({
+        "status": "ok",
+        "count": insights.len(),
+        "insights": insights.iter().map(|i| json!({
+            "task_description": i.task_description,
+            "agent_name": i.agent_name,
+            "verdict": i.verdict,
+            "confidence": i.confidence,
+            "total_steps": i.total_steps,
+            "success_rate": i.success_rate,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+fn batching_insights(db: &MemoryDb) -> flowforge_core::Result<Value> {
+    let stats = db.get_global_batching_stats(2, 20)?;
+    Ok(json!({
+        "status": "ok",
+        "count": stats.len(),
+        "opportunities": stats.iter().map(|o| json!({
+            "tool_name": o.tool_name,
+            "max_consecutive": o.consecutive_count,
+            "occurrences": o.occurrence_count,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 pub fn current_session_id(db: &MemoryDb) -> String {
     db.get_current_session()
         .ok()
@@ -588,9 +752,9 @@ mod tests {
     use crate::params::ParamExt;
 
     #[test]
-    fn test_registry_has_55_tools() {
+    fn test_registry_has_67_tools() {
         let registry = ToolRegistry::new();
-        assert_eq!(registry.list().len(), 55);
+        assert_eq!(registry.list().len(), 67);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use flowforge_core::FlowForgeConfig;
+use flowforge_core::{FlowForgeConfig, WorkStatus};
 use flowforge_memory::MemoryDb;
 
 use crate::params::ParamExt;
@@ -22,7 +22,7 @@ pub fn create(db: &MemoryDb, config: &FlowForgeConfig, p: &Value) -> flowforge_c
         item_type: item_type.to_string(),
         title: title.to_string(),
         description: description.map(|s| s.to_string()),
-        status: "pending".to_string(),
+        status: WorkStatus::Pending,
         assignee: None,
         parent_id: parent_id.map(|s| s.to_string()),
         priority,
@@ -43,11 +43,11 @@ pub fn create(db: &MemoryDb, config: &FlowForgeConfig, p: &Value) -> flowforge_c
 }
 
 pub fn list(db: &MemoryDb, p: &Value) -> flowforge_core::Result<Value> {
-    let status = p.opt_str("status");
+    let status: Option<WorkStatus> = p.opt_str("status").and_then(|s| s.parse().ok());
     let item_type = p.opt_str("type");
     let limit = p.u64_or("limit", 20) as usize;
     let filter = flowforge_core::WorkFilter {
-        status: status.map(|s| s.to_string()),
+        status,
         item_type: item_type.map(|s| s.to_string()),
         limit: Some(limit),
         ..Default::default()
@@ -73,9 +73,12 @@ pub fn list(db: &MemoryDb, p: &Value) -> flowforge_core::Result<Value> {
 
 pub fn update(db: &MemoryDb, config: &FlowForgeConfig, p: &Value) -> flowforge_core::Result<Value> {
     let id = p.require_str("id")?;
-    let new_status = p.require_str("status")?;
+    let new_status_str = p.require_str("status")?;
+    let new_status: WorkStatus = new_status_str
+        .parse()
+        .map_err(|e: String| flowforge_core::Error::Config(e))?;
     flowforge_core::work_tracking::update_status(db, &config.work_tracking, id, new_status, "mcp")?;
-    Ok(json!({"status": "ok", "id": id, "new_status": new_status}))
+    Ok(json!({"status": "ok", "id": id, "new_status": new_status_str}))
 }
 
 pub fn log(db: &MemoryDb, p: &Value) -> flowforge_core::Result<Value> {
@@ -122,7 +125,7 @@ pub fn sync(db: &MemoryDb, config: &FlowForgeConfig) -> flowforge_core::Result<V
 
 pub fn load(db: &MemoryDb) -> flowforge_core::Result<Value> {
     let filter = flowforge_core::WorkFilter {
-        status: Some("in_progress".to_string()),
+        status: Some(WorkStatus::InProgress),
         limit: Some(1000),
         ..Default::default()
     };
@@ -151,10 +154,10 @@ pub fn load(db: &MemoryDb) -> flowforge_core::Result<Value> {
 }
 
 pub fn status(db: &MemoryDb) -> flowforge_core::Result<Value> {
-    let pending = db.count_work_items_by_status("pending").unwrap_or(0);
-    let in_progress = db.count_work_items_by_status("in_progress").unwrap_or(0);
-    let completed = db.count_work_items_by_status("completed").unwrap_or(0);
-    let blocked = db.count_work_items_by_status("blocked").unwrap_or(0);
+    let pending = db.count_work_items_by_status(WorkStatus::Pending).unwrap_or(0);
+    let in_progress = db.count_work_items_by_status(WorkStatus::InProgress).unwrap_or(0);
+    let completed = db.count_work_items_by_status(WorkStatus::Completed).unwrap_or(0);
+    let blocked = db.count_work_items_by_status(WorkStatus::Blocked).unwrap_or(0);
     let total = pending + in_progress + completed + blocked;
     Ok(json!({
         "status": "ok",

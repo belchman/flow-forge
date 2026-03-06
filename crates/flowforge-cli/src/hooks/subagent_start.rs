@@ -65,7 +65,7 @@ pub fn run() -> flowforge_core::Result<()> {
         // Find actual in-progress work item to avoid FK errors (agent_id != work_item_id)
         let work_item_id = ctx.with_db("find_active_work_item", |db| {
             let filter = flowforge_core::WorkFilter {
-                status: Some("in_progress".to_string()),
+                status: Some(flowforge_core::WorkStatus::InProgress),
                 ..Default::default()
             };
             let items = db.list_work_items(&filter)?;

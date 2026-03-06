@@ -51,7 +51,7 @@ pub fn route_cached(
     p: &Value,
     registry: Option<&AgentRegistry>,
 ) -> flowforge_core::Result<Value> {
-    let task = p.str_or("task", "");
+    let task = p.require_str("task")?;
     let top_k = p.u64_or("top_k", 3) as usize;
     let reg = match registry {
         Some(r) => r,

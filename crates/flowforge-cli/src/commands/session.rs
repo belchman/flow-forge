@@ -15,19 +15,27 @@ fn open_db() -> Result<MemoryDb> {
     MemoryDb::open(&db_path)
 }
 
-pub fn current() -> Result<()> {
+pub fn current(json: bool) -> Result<()> {
     let db = open_db()?;
     match db.get_current_session()? {
         Some(session) => {
-            println!("{}", "Current Session".bold());
-            println!("ID:       {}", session.id.cyan());
-            println!("Started:  {}", session.started_at);
-            println!("CWD:      {}", session.cwd);
-            println!("Edits:    {}", session.edits);
-            println!("Commands: {}", session.commands);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&session).unwrap_or_default());
+            } else {
+                println!("{}", "Current Session".bold());
+                println!("ID:       {}", session.id.cyan());
+                println!("Started:  {}", session.started_at);
+                println!("CWD:      {}", session.cwd);
+                println!("Edits:    {}", session.edits);
+                println!("Commands: {}", session.commands);
+            }
         }
         None => {
-            println!("{}", "No active session".yellow());
+            if json {
+                println!("null");
+            } else {
+                println!("{}", "No active session".yellow());
+            }
         }
     }
     Ok(())
@@ -377,6 +385,96 @@ pub fn fork(
         fork_index,
         copied
     );
+    Ok(())
+}
+
+pub fn hook_timing(session_id: Option<&str>, json: bool) -> Result<()> {
+    let db = open_db()?;
+    let sid = resolve_session_id(&db, session_id)?;
+    let metrics = db.get_session_metrics(&sid)?;
+
+    // Collect hook timing entries
+    let mut hook_data: Vec<(&str, f64, f64, f64, f64)> = Vec::new();
+    for (name, total_ms) in &metrics {
+        if let Some(hook_name) = name.strip_prefix("hook_ms:") {
+            let calls = metrics
+                .get(&format!("hook_calls:{}", hook_name))
+                .copied()
+                .unwrap_or(1.0);
+            let errors = metrics
+                .get(&format!("hook_errors:{}", hook_name))
+                .copied()
+                .unwrap_or(0.0);
+            let avg_ms = if calls > 0.0 {
+                total_ms / calls
+            } else {
+                *total_ms
+            };
+            hook_data.push((hook_name, *total_ms, avg_ms, calls, errors));
+        }
+    }
+
+    if hook_data.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("{}", "No hook timing data for this session".yellow());
+        }
+        return Ok(());
+    }
+
+    hook_data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    if json {
+        let total_all: f64 = hook_data.iter().map(|(_, t, _, _, _)| t).sum();
+        let hooks: Vec<serde_json::Value> = hook_data
+            .iter()
+            .map(|(name, total, avg, calls, errors)| {
+                serde_json::json!({
+                    "hook": name,
+                    "total_ms": total,
+                    "avg_ms": avg,
+                    "calls": calls,
+                    "errors": errors,
+                })
+            })
+            .collect();
+        let obj = serde_json::json!({
+            "session_id": sid,
+            "hooks": hooks,
+            "total_ms": total_all,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
+        return Ok(());
+    }
+
+    println!("{}", "Hook Performance".bold());
+    println!(
+        "{:<25} {:>10} {:>10} {:>8} {:>8}",
+        "Hook", "Total (ms)", "Avg (ms)", "Calls", "Errors"
+    );
+    println!("{}", "─".repeat(65));
+
+    let total_all: f64 = hook_data.iter().map(|(_, t, _, _, _)| t).sum();
+
+    for (name, total, avg, calls, errors) in &hook_data {
+        let error_str = if *errors > 0.0 {
+            format!("{}", errors).red().to_string()
+        } else {
+            "0".to_string()
+        };
+        println!(
+            "{:<25} {:>10.0} {:>10.1} {:>8.0} {:>8}",
+            name, total, avg, calls, error_str
+        );
+    }
+
+    println!("{}", "─".repeat(65));
+    println!(
+        "{:<25} {:>10.0}",
+        "TOTAL", total_all
+    );
+
     Ok(())
 }
 

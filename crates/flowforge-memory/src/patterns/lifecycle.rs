@@ -131,14 +131,16 @@ impl<'a> PatternStore<'a> {
     }
 
     /// Get cluster-aware decay multiplier for a pattern.
-    /// Patterns in large clusters decay slower; outliers decay faster.
-    fn decay_multiplier(&self, embedding_id: Option<i64>) -> f64 {
+    /// Uses pre-loaded cluster sizes to avoid per-pattern DB lookups.
+    fn decay_multiplier_from_cache(
+        &self,
+        embedding_id: Option<i64>,
+        cluster_sizes: &std::collections::HashMap<i64, i64>,
+    ) -> f64 {
         if let Some(eid) = embedding_id {
-            if let Ok(Some(cluster_id)) = self.db.get_vector_cluster_id(eid) {
-                if let Ok(Some(cluster)) = self.db.get_cluster(cluster_id) {
-                    if cluster.member_count > 10 {
-                        return self.config.cluster_decay_active_factor; // Active cluster, slow decay
-                    }
+            if let Some(&member_count) = cluster_sizes.get(&eid) {
+                if member_count > 10 {
+                    return self.config.cluster_decay_active_factor; // Active cluster, slow decay
                 }
                 return 1.0; // Small cluster, normal decay
             }
@@ -147,9 +149,12 @@ impl<'a> PatternStore<'a> {
     }
 
     /// Apply confidence decay based on time since last use. (A6)
-    /// Uses cluster-aware decay multipliers.
+    /// Pre-loads all cluster sizes in one query to avoid N+1.
     pub(super) fn apply_decay(&self) -> Result<()> {
         let now = Utc::now();
+
+        // Pre-load cluster sizes for all pattern vectors in one JOIN query
+        let cluster_sizes = self.db.get_vector_cluster_sizes()?;
 
         // Short-term patterns: decay at configured rate * cluster multiplier
         let short_patterns = self.db.get_all_patterns_short()?;
@@ -158,7 +163,7 @@ impl<'a> PatternStore<'a> {
             if hours < 1.0 {
                 continue;
             }
-            let multiplier = self.decay_multiplier(p.embedding_id);
+            let multiplier = self.decay_multiplier_from_cache(p.embedding_id, &cluster_sizes);
             let decayed =
                 (p.confidence - (self.config.decay_rate_per_hour * hours * multiplier)).max(0.0);
             if decayed < 0.1 {
@@ -176,7 +181,7 @@ impl<'a> PatternStore<'a> {
             if hours < 1.0 {
                 continue;
             }
-            let multiplier = self.decay_multiplier(p.embedding_id);
+            let multiplier = self.decay_multiplier_from_cache(p.embedding_id, &cluster_sizes);
             let decay_rate = 0.001; // 0.1% per hour for long-term
             let decayed = (p.confidence - (decay_rate * hours * multiplier)).max(0.05);
             if (decayed - p.confidence).abs() > 0.001 {
@@ -188,17 +193,17 @@ impl<'a> PatternStore<'a> {
     }
 
     /// Expire short-term patterns past their TTL with low confidence.
+    /// Uses a batch SQL DELETE to avoid per-row overhead.
     pub(super) fn expire_short_term(&self) -> Result<()> {
-        let patterns = self.db.get_all_patterns_short()?;
-        let now = Utc::now();
-        let ttl = chrono::Duration::hours(self.config.short_term_ttl_hours as i64);
+        let threshold = Utc::now() - chrono::Duration::hours(self.config.short_term_ttl_hours as i64);
+        let threshold_str = threshold.to_rfc3339();
+        let min_conf = self.config.promotion_min_confidence;
 
-        for p in &patterns {
-            if now - p.created_at > ttl && p.confidence < self.config.promotion_min_confidence {
-                self.db.delete_pattern_short(&p.id)?;
-                self.db.delete_vectors_for_source("pattern_short", &p.id)?;
-            }
-        }
+        // Clean up associated vectors first (needs the IDs)
+        self.db.batch_delete_expired_short_vectors(&threshold_str, min_conf)?;
+
+        // Then batch-delete the patterns themselves
+        self.db.batch_delete_expired_short_patterns(&threshold_str, min_conf)?;
 
         Ok(())
     }

@@ -1,8 +1,43 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Work item status with compiler-enforced valid values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+}
+
+impl std::fmt::Display for WorkStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::InProgress => write!(f, "in_progress"),
+            Self::Completed => write!(f, "completed"),
+            Self::Blocked => write!(f, "blocked"),
+        }
+    }
+}
+
+impl std::str::FromStr for WorkStatus {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "pending" | "open" | "backlog" => Ok(Self::Pending),
+            "in_progress" => Ok(Self::InProgress),
+            "completed" | "closed" | "done" => Ok(Self::Completed),
+            "blocked" => Ok(Self::Blocked),
+            other => Err(format!("unknown work status: {other}")),
+        }
+    }
+}
+
 /// Work item for tracking tasks/epics/bugs across backends
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: String,
     #[serde(default)]
@@ -13,8 +48,8 @@ pub struct WorkItem {
     pub title: String,
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default = "default_work_status")]
-    pub status: String,
+    #[serde(default)]
+    pub status: WorkStatus,
     #[serde(default)]
     pub assignee: Option<String>,
     #[serde(default)]
@@ -47,15 +82,12 @@ pub struct WorkItem {
 fn default_item_type() -> String {
     "task".to_string()
 }
-fn default_work_status() -> String {
-    "pending".to_string()
-}
 fn default_work_priority() -> i32 {
     2
 }
 
 /// Work event for audit trail
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkEvent {
     pub id: i64,
     pub work_item_id: String,
@@ -72,7 +104,7 @@ pub struct WorkEvent {
 /// Filter for querying work items
 #[derive(Debug, Clone, Default)]
 pub struct WorkFilter {
-    pub status: Option<String>,
+    pub status: Option<WorkStatus>,
     pub item_type: Option<String>,
     pub backend: Option<String>,
     pub assignee: Option<String>,

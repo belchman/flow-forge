@@ -16,15 +16,10 @@ pub fn run() -> Result<()> {
     let _ = state_mgr.update_member_status(&agent_id, TeamMemberStatus::Completed, None);
     let _ = state_mgr.add_event(format!("{} stopped", agent_id));
 
-    // Ingest agent transcript, end agent session, and roll up stats to parent
+    // End agent session and roll up stats to parent
     // Wrapped in a transaction so crash between steps doesn't leave orphans
     ctx.with_db("end_agent_session", |db| {
         db.with_transaction(|| {
-            if let Some(ref path) = input.common.transcript_path {
-                if std::path::Path::new(path.as_str()).exists() {
-                    db.ingest_transcript(&agent_id, path)?;
-                }
-            }
             // Roll up agent edits/commands to parent session BEFORE ending
             // (so the statusline reflects cumulative work from all agents)
             db.rollup_agent_stats_to_parent(&agent_id)?;
@@ -38,7 +33,7 @@ pub fn run() -> Result<()> {
         // Find actual in-progress work item to avoid FK errors (agent_id != work_item_id)
         let work_item_id = ctx.with_db("find_active_work_item", |db| {
             let filter = flowforge_core::WorkFilter {
-                status: Some("in_progress".to_string()),
+                status: Some(flowforge_core::WorkStatus::InProgress),
                 ..Default::default()
             };
             let items = db.list_work_items(&filter)?;

@@ -43,10 +43,9 @@ pub fn delete(db: &MemoryDb, p: &Value) -> flowforge_core::Result<Value> {
 pub fn list(db: &MemoryDb, p: &Value) -> flowforge_core::Result<Value> {
     let namespace = p.str_or("category", "default");
     let limit = p.u64_or("limit", 50) as usize;
-    let entries = db.kv_list(namespace)?;
+    let entries = db.kv_list_limited(namespace, limit)?;
     let entries: Vec<Value> = entries
         .iter()
-        .take(limit)
         .map(|(k, v)| json!({"key": k, "value": v}))
         .collect();
     Ok(json!({"status": "ok", "entries": entries}))

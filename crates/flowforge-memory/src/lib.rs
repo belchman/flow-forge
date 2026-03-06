@@ -7,6 +7,7 @@ pub mod patterns;
 pub mod test_helpers;
 pub mod trajectory;
 
+pub use db::failure_patterns::FailurePattern;
 pub use db::MemoryDb;
 #[cfg(feature = "semantic")]
 pub use embedding::SemanticEmbedder;

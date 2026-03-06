@@ -3,7 +3,7 @@ use flowforge_core::{Error, Result};
 use super::{is_transient_sqlite, MemoryDb, SqliteExt};
 
 /// Bump this whenever init_schema() changes (new tables, columns, indexes).
-pub(crate) const SCHEMA_VERSION: u32 = 7;
+pub(crate) const SCHEMA_VERSION: u32 = 8;
 
 impl MemoryDb {
     pub(crate) fn init_schema(&self) -> Result<()> {
@@ -373,7 +373,8 @@ impl MemoryDb {
         // Additional indexes (v6): support delete_vectors_for_source and get_agents_on_work_item
         let _ = self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_hnsw_source ON hnsw_entries(source_type, source_id);
-             CREATE INDEX IF NOT EXISTS idx_agent_sessions_task ON agent_sessions(task_id);",
+             CREATE INDEX IF NOT EXISTS idx_agent_sessions_task ON agent_sessions(task_id);
+             CREATE INDEX IF NOT EXISTS idx_edits_session ON edits(session_id);",
         );
 
         // v7 migration: add FK constraints to trajectories and context_injections
@@ -440,8 +441,180 @@ impl MemoryDb {
             )
             .sq()?;
 
-        // Re-enable foreign keys
+        
+        // ── v14: Error recovery, discovered capabilities, recovery strategies,
+        //         tool metrics, session metrics ──
+
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS error_fingerprints (
+                id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL UNIQUE,
+                category TEXT NOT NULL DEFAULT 'unknown',
+                tool_name TEXT,
+                error_preview TEXT NOT NULL DEFAULT '',
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_error_fp ON error_fingerprints(fingerprint);
+
+            CREATE TABLE IF NOT EXISTS error_resolutions (
+                id TEXT PRIMARY KEY,
+                fingerprint_id TEXT NOT NULL REFERENCES error_fingerprints(id) ON DELETE CASCADE,
+                resolution_summary TEXT NOT NULL,
+                tool_sequence TEXT NOT NULL DEFAULT '[]',
+                files_changed TEXT NOT NULL DEFAULT '[]',
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_used TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_error_res_fp ON error_resolutions(fingerprint_id);
+
+            CREATE TABLE IF NOT EXISTS session_tool_failures (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                input_hash TEXT NOT NULL DEFAULT '',
+                error_preview TEXT NOT NULL DEFAULT '',
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_stf_session ON session_tool_failures(session_id);
+            CREATE INDEX IF NOT EXISTS idx_stf_tool ON session_tool_failures(session_id, tool_name, input_hash);
+
+            CREATE TABLE IF NOT EXISTS discovered_capabilities (
+                id INTEGER PRIMARY KEY,
+                agent_name TEXT NOT NULL,
+                capability TEXT NOT NULL DEFAULT '',
+                task_pattern TEXT NOT NULL,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                last_seen TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(agent_name, task_pattern)
+            );
+            CREATE INDEX IF NOT EXISTS idx_disc_cap_agent ON discovered_capabilities(agent_name);
+
+            CREATE TABLE IF NOT EXISTS recovery_strategies (
+                id INTEGER PRIMARY KEY,
+                gate_name TEXT NOT NULL,
+                trigger_pattern TEXT NOT NULL DEFAULT '',
+                suggestion TEXT NOT NULL,
+                alternative_command TEXT,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_used TEXT,
+                UNIQUE(gate_name, trigger_pattern, suggestion)
+            );
+            CREATE INDEX IF NOT EXISTS idx_recovery_gate ON recovery_strategies(gate_name);
+
+            CREATE TABLE IF NOT EXISTS tool_success_metrics (
+                id INTEGER PRIMARY KEY,
+                tool_name TEXT NOT NULL,
+                agent_name TEXT NOT NULL DEFAULT '',
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                total_duration_ms INTEGER NOT NULL DEFAULT 0,
+                last_updated TEXT NOT NULL,
+                UNIQUE(tool_name, agent_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tsm_tool ON tool_success_metrics(tool_name);
+
+            CREATE TABLE IF NOT EXISTS session_metrics (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                metric_value REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                UNIQUE(session_id, metric_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sm_session ON session_metrics(session_id);
+
+            CREATE TABLE IF NOT EXISTS routing_outcomes (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                task_pattern TEXT NOT NULL,
+                pattern_score REAL NOT NULL DEFAULT 0.0,
+                capability_score REAL NOT NULL DEFAULT 0.0,
+                learned_score REAL NOT NULL DEFAULT 0.0,
+                priority_score REAL NOT NULL DEFAULT 0.0,
+                context_score REAL NOT NULL DEFAULT 0.0,
+                semantic_score REAL NOT NULL DEFAULT 0.0,
+                outcome TEXT NOT NULL DEFAULT 'unknown',
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ro_session ON routing_outcomes(session_id);
+            CREATE INDEX IF NOT EXISTS idx_ro_agent ON routing_outcomes(agent_name);
+        ").sq()?;
+
+        // Seed default recovery strategies
+        super::recovery_strategies::seed_default_strategies(self)?;
+
+// Re-enable foreign keys
         self.conn.execute_batch("PRAGMA foreign_keys = ON").sq()?;
+
+        // v8 migration: failure pattern detection and prevention
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS failure_patterns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pattern_name TEXT NOT NULL UNIQUE,
+                    description TEXT NOT NULL,
+                    trigger_tools TEXT NOT NULL,
+                    prevention_hint TEXT NOT NULL,
+                    occurrence_count INTEGER NOT NULL DEFAULT 0,
+                    prevented_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_triggered TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_failure_patterns_name ON failure_patterns(pattern_name);
+                ",
+            )
+            .sq()?;
+
+        // Seed built-in failure patterns (idempotent via INSERT OR IGNORE)
+        super::failure_patterns::seed_default_failure_patterns(self)?;
+
+        // File co-edit dependency graph
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS file_co_edits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_a TEXT NOT NULL,
+                    file_b TEXT NOT NULL,
+                    co_edit_count INTEGER NOT NULL DEFAULT 1,
+                    last_seen TEXT NOT NULL,
+                    UNIQUE(file_a, file_b)
+                );
+                CREATE INDEX IF NOT EXISTS idx_file_coedits_a ON file_co_edits(file_a);
+                CREATE INDEX IF NOT EXISTS idx_file_coedits_b ON file_co_edits(file_b);
+                ",
+            )
+            .sq()?;
+
+        // Test co-occurrence suggestions
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS test_co_occurrences (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    edited_file TEXT NOT NULL,
+                    test_file TEXT NOT NULL,
+                    test_command TEXT,
+                    occurrence_count INTEGER NOT NULL DEFAULT 1,
+                    last_seen TEXT NOT NULL,
+                    UNIQUE(edited_file, test_file)
+                );
+                CREATE INDEX IF NOT EXISTS idx_test_cooccur_edited ON test_co_occurrences(edited_file);
+                CREATE INDEX IF NOT EXISTS idx_test_cooccur_test ON test_co_occurrences(test_file);
+                ",
+            )
+            .sq()?;
 
         Ok(())
     }

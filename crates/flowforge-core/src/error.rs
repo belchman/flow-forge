@@ -28,9 +28,6 @@ pub enum Error {
     #[error("Memory error: {0}")]
     Memory(String),
 
-    #[error("SQLite error: {0}")]
-    Sqlite(String),
-
     #[error("Database error{}: {message}", if *.transient { " (transient)" } else { "" })]
     Database { message: String, transient: bool },
 
@@ -95,7 +92,11 @@ mod tests {
 
     #[test]
     fn test_is_transient_other_variants() {
-        assert!(!Error::Sqlite("test".to_string()).is_transient());
+        assert!(!Error::Database {
+            message: "test".to_string(),
+            transient: false,
+        }
+        .is_transient());
         assert!(!Error::Config("test".to_string()).is_transient());
         assert!(!Error::Memory("test".to_string()).is_transient());
     }

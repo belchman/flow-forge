@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use crate::config::WorkTrackingConfig;
-use crate::types::WorkItem;
+use crate::types::{WorkItem, WorkStatus};
 use crate::Result;
 
 use super::claude_tasks::sync_to_claude_tasks;
@@ -53,7 +53,7 @@ pub(crate) trait WorkBackend {
     /// Update an item with full field sync (title, description, assignee, priority, labels).
     /// Default: delegates to update_status for backwards compatibility.
     fn update_item(&self, external_id: &str, item: &WorkItem) -> Result<()> {
-        self.update_status(external_id, &item.status)
+        self.update_status(external_id, &item.status.to_string())
     }
     /// Add a comment to an item in the external backend.
     /// Default: no-op (not all backends support comments).
@@ -145,7 +145,7 @@ impl WorkBackend for KanbusBackend {
     }
 
     fn update_item(&self, external_id: &str, item: &WorkItem) -> Result<()> {
-        if item.status == "completed" {
+        if item.status == WorkStatus::Completed {
             if let Err(e) =
                 with_stderr_suppressed(|| kanbus::issue_close::close_issue(&self.root, external_id))
             {
@@ -154,11 +154,11 @@ impl WorkBackend for KanbusBackend {
             return Ok(());
         }
 
-        let kanbus_status = match item.status.as_str() {
-            "pending" => "open",
-            "in_progress" => "in_progress",
-            "blocked" => "blocked",
-            other => other,
+        let kanbus_status = match item.status {
+            WorkStatus::Pending => "open",
+            WorkStatus::InProgress => "in_progress",
+            WorkStatus::Blocked => "blocked",
+            WorkStatus::Completed => unreachable!(),
         };
 
         let root = self.root.clone();
@@ -235,13 +235,7 @@ impl WorkBackend for KanbusBackend {
                 continue;
             }
 
-            let status = match issue.status.as_str() {
-                "closed" => "completed",
-                "open" | "backlog" => "pending",
-                "in_progress" => "in_progress",
-                "blocked" => "blocked",
-                other => other,
-            };
+            let status: WorkStatus = issue.status.parse().unwrap_or(WorkStatus::Pending);
 
             let priority = issue.priority.clamp(1, 4);
 
@@ -256,14 +250,14 @@ impl WorkBackend for KanbusBackend {
                 } else {
                     Some(issue.description.clone())
                 },
-                status: status.to_string(),
+                status,
                 assignee: issue.assignee.clone(),
                 parent_id: issue.parent.clone(),
                 priority,
                 labels: issue.labels.clone(),
                 created_at: now,
                 updated_at: now,
-                completed_at: if status == "completed" {
+                completed_at: if status == WorkStatus::Completed {
                     Some(now)
                 } else {
                     None
@@ -329,7 +323,7 @@ impl WorkBackend for BeadsBackend {
     }
 
     fn update_item(&self, external_id: &str, item: &WorkItem) -> Result<()> {
-        if item.status == "completed" {
+        if item.status == WorkStatus::Completed {
             let result = std::process::Command::new("bd")
                 .arg("close")
                 .arg(external_id)
@@ -343,7 +337,7 @@ impl WorkBackend for BeadsBackend {
         let mut cmd = std::process::Command::new("bd");
         cmd.arg("update").arg(external_id);
         cmd.arg("--title").arg(&item.title);
-        cmd.arg("--status").arg(&item.status);
+        cmd.arg("--status").arg(item.status.to_string());
         cmd.arg("--priority")
             .arg(item.priority.clamp(0, 4).to_string());
         if let Some(ref desc) = item.description {
@@ -412,11 +406,11 @@ impl WorkBackend for BeadsBackend {
                 continue;
             }
 
-            let status = match item["status"].as_str().unwrap_or("open") {
-                "closed" | "done" => "completed",
-                "open" => "pending",
-                other => other,
-            };
+            let status: WorkStatus = item["status"]
+                .as_str()
+                .unwrap_or("open")
+                .parse()
+                .unwrap_or(WorkStatus::Pending);
 
             let work_item = WorkItem {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -425,7 +419,7 @@ impl WorkBackend for BeadsBackend {
                 item_type: "task".to_string(),
                 title: item["title"].as_str().unwrap_or("(untitled)").to_string(),
                 description: item["body"].as_str().map(|s| s.to_string()),
-                status: status.to_string(),
+                status,
                 assignee: None,
                 parent_id: None,
                 priority: 2,

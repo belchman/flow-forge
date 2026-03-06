@@ -58,6 +58,83 @@ pub fn run() -> Result<()> {
         Ok(())
     });
 
+    // Record test co-occurrences: when a test command runs after file edits, link them
+    if input.tool_name == "Bash" {
+        if let Some(cmd) = input.tool_input.get("command").and_then(|v| v.as_str()) {
+            if is_test_command(cmd) {
+                ctx.with_db("record_test_co_occurrence", |db| {
+                    if let Some(session) = db.get_current_session()? {
+                        let edits = db.get_edits_for_session(&session.id)?;
+                        let mut seen = std::collections::HashSet::new();
+                        let recent_files: Vec<String> = edits
+                            .iter()
+                            .rev()
+                            .filter(|e| seen.insert(e.file_path.clone()))
+                            .take(10)
+                            .map(|e| e.file_path.clone())
+                            .collect();
+
+                        let test_file = extract_test_target(cmd);
+                        for file in &recent_files {
+                            db.record_test_co_occurrence(file, &test_file, Some(cmd))?;
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    // Check recent tool sequence against failure patterns (observational logging)
+    ctx.with_db("check_failure_patterns", |db| {
+        if let Some(session) = db.get_current_session()? {
+            if let Some(trajectory) = db.get_active_trajectory(&session.id)? {
+                let steps = db.get_trajectory_steps(&trajectory.id)?;
+                let recent_tools: Vec<&str> = steps
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(|s| s.tool_name.as_str())
+                    .collect();
+
+                let matches = db.check_failure_pattern(&recent_tools)?;
+                for m in &matches {
+                    // Only log high-frequency patterns to avoid flooding hook-errors.log
+                    if m.occurrence_count > 2 {
+                        if let Ok(project_dir) = std::env::current_dir() {
+                            let log_path = project_dir.join(".flowforge").join("hook-errors.log");
+                            if let Ok(mut file) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&log_path)
+                            {
+                                use std::io::Write;
+                                let _ = writeln!(
+                                    file,
+                                    "[{}] WARN failure_pattern_triggered: {} -- {} (hint: {})",
+                                    Utc::now().to_rfc3339(),
+                                    m.pattern_name,
+                                    m.description,
+                                    m.prevention_hint,
+                                );
+                            }
+                        }
+                    }
+                    db.record_failure_pattern(
+                        &m.pattern_name,
+                        &m.description,
+                        &m.trigger_tools,
+                        &m.prevention_hint,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    });
+
     Ok(())
 }
 
@@ -122,7 +199,10 @@ fn sync_claude_task_update(
         db.set_meta(&format!("claude_task_status:{}", task_id), new_status)?;
     }
 
-    let ff_status = new_status;
+    let ff_status: flowforge_core::WorkStatus = match new_status.parse() {
+        Ok(s) => s,
+        Err(_) => return Ok(()), // Unknown status (e.g. "deleted"), skip
+    };
 
     // Find the parent work item: by title match first, then any in-progress item
     let subject = input.tool_input.get("subject").and_then(|v| v.as_str());
@@ -131,7 +211,7 @@ fn sync_claude_task_update(
         .or_else(|| {
             // Fall back to any in-progress work item (the active kanbus item)
             let filter = flowforge_core::WorkFilter {
-                status: Some("in_progress".to_string()),
+                status: Some(flowforge_core::WorkStatus::InProgress),
                 ..Default::default()
             };
             db.list_work_items(&filter)
@@ -192,7 +272,7 @@ mod tests {
         }
     }
 
-    fn make_work_item(id: &str, title: &str, status: &str) -> WorkItem {
+    fn make_work_item(id: &str, title: &str, status: flowforge_core::WorkStatus) -> WorkItem {
         WorkItem {
             id: id.to_string(),
             external_id: None,
@@ -200,7 +280,7 @@ mod tests {
             item_type: "task".to_string(),
             title: title.to_string(),
             description: None,
-            status: status.to_string(),
+            status,
             assignee: None,
             parent_id: None,
             priority: 2,
@@ -281,7 +361,7 @@ mod tests {
         let config = test_config();
 
         // Create a work item with a specific title
-        let item = make_work_item("wi-1", "Deploy new API", "in_progress");
+        let item = make_work_item("wi-1", "Deploy new API", flowforge_core::WorkStatus::InProgress);
         db.create_work_item(&item).unwrap();
 
         // TaskUpdate with matching subject
@@ -294,7 +374,7 @@ mod tests {
 
         // Work item should now be completed
         let updated = db.get_work_item("wi-1").unwrap().unwrap();
-        assert_eq!(updated.status, "completed");
+        assert_eq!(updated.status, flowforge_core::WorkStatus::Completed);
     }
 
     #[test]
@@ -303,7 +383,7 @@ mod tests {
         let config = test_config();
 
         // Parent kanbus item
-        let item = make_work_item("wi-parent", "Big feature implementation", "in_progress");
+        let item = make_work_item("wi-parent", "Big feature implementation", flowforge_core::WorkStatus::InProgress);
         db.create_work_item(&item).unwrap();
 
         // First, simulate TaskCreate to store the KV mapping
@@ -329,7 +409,7 @@ mod tests {
 
         // Parent should NOT be completed — it's a subtask
         let parent = db.get_work_item("wi-parent").unwrap().unwrap();
-        assert_eq!(parent.status, "in_progress");
+        assert_eq!(parent.status, flowforge_core::WorkStatus::InProgress);
 
         // But a subtask_status event should be logged against the parent
         let events = db.get_work_events("wi-parent", 10).unwrap();
@@ -363,7 +443,7 @@ mod tests {
         let db = test_db();
         let config = test_config();
 
-        let item = make_work_item("wi-del", "Some task", "in_progress");
+        let item = make_work_item("wi-del", "Some task", flowforge_core::WorkStatus::InProgress);
         db.create_work_item(&item).unwrap();
 
         let input = make_input(
@@ -375,7 +455,7 @@ mod tests {
 
         // Item should remain in_progress — deleted is not synced
         let fetched = db.get_work_item("wi-del").unwrap().unwrap();
-        assert_eq!(fetched.status, "in_progress");
+        assert_eq!(fetched.status, flowforge_core::WorkStatus::InProgress);
     }
 
     #[test]
@@ -409,6 +489,83 @@ mod tests {
         let stored = db.get_meta("claude_task_status:task-5").unwrap();
         assert_eq!(stored.as_deref(), Some("in_progress"));
     }
+
+    // ── Test detection tests ──
+
+    #[test]
+    fn test_is_test_command_detects_cargo_test() {
+        assert!(is_test_command("cargo test --workspace"));
+        assert!(is_test_command("cargo test -p flowforge-memory"));
+        assert!(is_test_command("  cargo test"));
+    }
+
+    #[test]
+    fn test_is_test_command_detects_other_runners() {
+        assert!(is_test_command("npm test"));
+        assert!(is_test_command("pytest tests/"));
+        assert!(is_test_command("go test ./..."));
+        assert!(is_test_command("npx jest"));
+        assert!(is_test_command("npx vitest run"));
+    }
+
+    #[test]
+    fn test_is_test_command_rejects_non_test() {
+        assert!(!is_test_command("cargo build"));
+        assert!(!is_test_command("git status"));
+        assert!(!is_test_command("echo 'cargo test'"));
+        assert!(!is_test_command("ls tests/"));
+    }
+
+    #[test]
+    fn test_extract_test_target_package() {
+        let target = extract_test_target("cargo test --package flowforge-memory");
+        assert_eq!(target, "test:flowforge-memory");
+
+        let target = extract_test_target("cargo test -p flowforge-cli");
+        assert_eq!(target, "test:flowforge-cli");
+    }
+
+    #[test]
+    fn test_extract_test_target_fallback() {
+        let target = extract_test_target("cargo test --workspace");
+        assert!(target.starts_with("test:"));
+    }
+}
+
+/// Detect common test commands from various ecosystems.
+fn is_test_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    trimmed.starts_with("cargo test")
+        || trimmed.starts_with("npm test")
+        || trimmed.starts_with("npx jest")
+        || trimmed.starts_with("npx vitest")
+        || trimmed.starts_with("pytest")
+        || trimmed.starts_with("python -m pytest")
+        || trimmed.starts_with("go test")
+        || trimmed.starts_with("make test")
+        || trimmed.starts_with("./gradlew test")
+        || trimmed.starts_with("bundle exec rspec")
+        || trimmed.starts_with("mix test")
+        || trimmed.starts_with("dotnet test")
+}
+
+/// Extract a meaningful test target from a test command.
+/// Returns the specific test file/module if specified, or a generic label.
+fn extract_test_target(cmd: &str) -> String {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    // Look for --package, -p, or specific test file paths
+    for (i, part) in parts.iter().enumerate() {
+        if (*part == "--package" || *part == "-p") && i + 1 < parts.len() {
+            return format!("test:{}", parts[i + 1]);
+        }
+        // Detect test file paths (e.g., tests/foo.rs, test_*.py)
+        if part.contains("test") && (part.contains('/') || part.contains('.')) {
+            return format!("test:{}", part);
+        }
+    }
+    // Fall back to the full command (truncated)
+    let target: String = cmd.chars().take(100).collect();
+    format!("test:{}", target)
 }
 
 fn record_edit(input: &PostToolUseInput, db: &MemoryDb) -> Result<()> {

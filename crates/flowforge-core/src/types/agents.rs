@@ -87,3 +87,14 @@ pub struct RoutingBreakdown {
     #[serde(default)]
     pub context_score: f64,
 }
+
+/// A capability discovered through observing agent success/failure patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredCapability {
+    pub agent_name: String,
+    pub capability: String,
+    pub task_pattern: String,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub confidence: f64,
+}

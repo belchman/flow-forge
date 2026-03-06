@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod config;
+pub mod error;
 pub mod guidance;
 pub mod init;
 pub mod learn;

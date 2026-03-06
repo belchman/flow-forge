@@ -3,7 +3,7 @@ use rusqlite::{params, OptionalExtension};
 
 use flowforge_core::{
     work_tracking::{WorkDb, WorkStealing},
-    Result, WorkEvent, WorkFilter, WorkItem,
+    Result, WorkEvent, WorkFilter, WorkItem, WorkStatus,
 };
 
 use super::row_parsers::parse_work_item_row;
@@ -15,6 +15,7 @@ impl MemoryDb {
     pub fn create_work_item(&self, item: &WorkItem) -> Result<()> {
         let labels_json = serde_json::to_string(&item.labels).unwrap_or_else(|_| "[]".to_string());
         let priority = item.priority.clamp(0, 4);
+        let status_str = item.status.to_string();
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO work_items
@@ -29,7 +30,7 @@ impl MemoryDb {
                     item.item_type,
                     item.title,
                     item.description,
-                    item.status,
+                    status_str,
                     item.assignee,
                     item.parent_id,
                     priority,
@@ -78,18 +79,19 @@ impl MemoryDb {
             .sq()
     }
 
-    pub fn update_work_item_status(&self, id: &str, status: &str) -> Result<()> {
+    pub fn update_work_item_status(&self, id: &str, status: WorkStatus) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let completed_at = if status == "completed" {
+        let completed_at = if status == WorkStatus::Completed {
             Some(now.clone())
         } else {
             None
         };
+        let status_str = status.to_string();
         self.conn
             .execute(
                 "UPDATE work_items SET status = ?1, updated_at = ?2, completed_at = COALESCE(?3, completed_at)
                  WHERE id = ?4",
-                params![status, now, completed_at, id],
+                params![status_str, now, completed_at, id],
             )
             .sq()?;
         Ok(())
@@ -115,8 +117,8 @@ impl MemoryDb {
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        if let Some(ref status) = filter.status {
-            param_values.push(Box::new(status.clone()));
+        if let Some(status) = filter.status {
+            param_values.push(Box::new(status.to_string()));
             sql.push_str(&format!(" AND status = ?{}", param_values.len()));
         }
         if let Some(ref item_type) = filter.item_type {
@@ -215,11 +217,12 @@ impl MemoryDb {
             .sq()
     }
 
-    pub fn count_work_items_by_status(&self, status: &str) -> Result<u64> {
+    pub fn count_work_items_by_status(&self, status: WorkStatus) -> Result<u64> {
+        let status_str = status.to_string();
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM work_items WHERE status = ?1",
-                params![status],
+                params![status_str],
                 |row| row.get(0),
             )
             .sq()
@@ -490,7 +493,7 @@ impl WorkDb for MemoryDb {
     fn get_work_item_by_external_id(&self, external_id: &str) -> Result<Option<WorkItem>> {
         self.get_work_item_by_external_id(external_id)
     }
-    fn update_work_item_status(&self, id: &str, status: &str) -> Result<()> {
+    fn update_work_item_status(&self, id: &str, status: WorkStatus) -> Result<()> {
         self.update_work_item_status(id, status)
     }
     fn update_work_item_assignee(&self, id: &str, assignee: &str) -> Result<()> {
@@ -508,7 +511,7 @@ impl WorkDb for MemoryDb {
     fn delete_work_item(&self, id: &str) -> Result<()> {
         self.delete_work_item(id)
     }
-    fn count_work_items_by_status(&self, status: &str) -> Result<u64> {
+    fn count_work_items_by_status(&self, status: WorkStatus) -> Result<u64> {
         self.count_work_items_by_status(status)
     }
     fn record_work_event(&self, event: &WorkEvent) -> Result<i64> {

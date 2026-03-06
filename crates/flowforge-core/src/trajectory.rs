@@ -123,3 +123,14 @@ pub struct TrajectoryStep {
     pub duration_ms: Option<i64>,
     pub timestamp: DateTime<Utc>,
 }
+
+/// Summary insight from a past trajectory for cross-session knowledge transfer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrajectoryInsight {
+    pub task_description: String,
+    pub agent_name: Option<String>,
+    pub verdict: Option<String>,
+    pub confidence: f64,
+    pub total_steps: u64,
+    pub success_rate: f64,
+}
