@@ -168,6 +168,43 @@ pub fn update_status(
     Ok(())
 }
 
+/// Add a comment to a work item (syncs to external backend).
+pub fn add_comment(
+    db: &dyn WorkDb,
+    config: &WorkTrackingConfig,
+    id: &str,
+    author: &str,
+    text: &str,
+) -> Result<()> {
+    let item = db
+        .get_work_item(id)?
+        .ok_or_else(|| crate::Error::NotFound(format!("Work item '{id}' not found")))?;
+
+    // Record as work event
+    let event = WorkEvent {
+        id: 0,
+        work_item_id: id.to_string(),
+        event_type: "comment".to_string(),
+        old_value: None,
+        new_value: Some(text.to_string()),
+        actor: Some(author.to_string()),
+        timestamp: chrono::Utc::now(),
+    };
+    db.record_work_event(&event)?;
+
+    // Sync to external backend
+    let (_backend_name, backend) = resolve_backend(config);
+    if let Some(b) = backend {
+        if let Some(ref ext_id) = item.external_id {
+            if let Err(e) = b.add_comment(ext_id, author, text) {
+                eprintln!("[FlowForge] warning: failed to add backend comment: {e}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Close a work item (set to completed).
 pub fn close_item(
     db: &dyn WorkDb,

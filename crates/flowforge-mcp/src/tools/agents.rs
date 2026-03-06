@@ -64,7 +64,7 @@ pub fn route_cached(
         learned_weights.insert((w.task_pattern.clone(), w.agent_name.clone()), w.weight);
     }
     let agent_refs: Vec<&_> = reg.list();
-    let results = router.route(task, &agent_refs, &learned_weights, None);
+    let results = router.route(task, &agent_refs, &learned_weights, None, None);
     let candidates: Vec<Value> = results
         .iter()
         .take(top_k)

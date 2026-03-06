@@ -183,6 +183,7 @@ mod tests {
             patterns: Vec::new(),
             priority: Priority::Normal,
             color: None,
+            routing_category: flowforge_core::RoutingCategory::Core,
             body: String::new(),
             source: AgentSource::BuiltIn,
         }

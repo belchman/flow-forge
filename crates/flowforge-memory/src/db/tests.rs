@@ -394,9 +394,9 @@ fn test_record_session_effectiveness() {
         transcript_path: None,
     };
     db.create_session(&session).unwrap();
-    db.record_context_injection(session_id, None, "pattern", Some("pat-1"), Some(0.8))
+    db.record_context_injection(session_id, None, "pattern", Some("pat-1"), Some(0.8), None)
         .unwrap();
-    db.record_context_injection(session_id, None, "pattern", Some("pat-2"), Some(0.6))
+    db.record_context_injection(session_id, None, "pattern", Some("pat-2"), Some(0.6), None)
         .unwrap();
     assert_eq!(
         db.record_session_effectiveness(session_id, "success")
@@ -835,10 +835,10 @@ fn test_record_and_query_context_injection() {
     };
     db.create_session(&session).unwrap();
     let id1 = db
-        .record_context_injection("inj-sess", None, "pattern", Some("pat-1"), Some(0.9))
+        .record_context_injection("inj-sess", None, "pattern", Some("pat-1"), Some(0.9), None)
         .unwrap();
     let id2 = db
-        .record_context_injection("inj-sess", None, "trajectory", Some("traj-1"), Some(0.7))
+        .record_context_injection("inj-sess", None, "trajectory", Some("traj-1"), Some(0.7), None)
         .unwrap();
     assert!(id1 > 0);
     assert!(id2 > id1);
@@ -852,7 +852,7 @@ fn test_record_and_query_context_injection() {
 fn test_rate_context_injection() {
     let db = test_db();
     let id = db
-        .record_context_injection("rate-sess", None, "pattern", Some("p"), Some(0.5))
+        .record_context_injection("rate-sess", None, "pattern", Some("p"), Some(0.5), None)
         .unwrap();
     db.rate_context_injection(id, "correlated_success").unwrap();
     let injections = db.get_injections_for_session("rate-sess").unwrap();
@@ -863,9 +863,9 @@ fn test_rate_context_injection() {
 #[test]
 fn test_rate_session_injections() {
     let db = test_db();
-    db.record_context_injection("batch-sess", None, "pattern", Some("p1"), Some(0.8))
+    db.record_context_injection("batch-sess", None, "pattern", Some("p1"), Some(0.8), None)
         .unwrap();
-    db.record_context_injection("batch-sess", None, "pattern", Some("p2"), Some(0.6))
+    db.record_context_injection("batch-sess", None, "pattern", Some("p2"), Some(0.6), None)
         .unwrap();
     let rated = db
         .rate_session_injections("batch-sess", "correlated_success")

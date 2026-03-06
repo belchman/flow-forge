@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use flowforge_core::config::RoutingConfig;
-use flowforge_core::{AgentDef, RoutingBreakdown, RoutingContext, RoutingResult};
+use flowforge_core::{AgentDef, RoutingBreakdown, RoutingCategory, RoutingContext, RoutingResult};
 use regex::Regex;
 use tracing::warn;
 
@@ -12,12 +12,44 @@ use tracing::warn;
 ///       + learned_weight * learned_score
 ///       + priority_weight * priority_score
 ///       + context_weight * context_score
+///       + semantic_weight * semantic_score
 pub struct AgentRouter {
     pattern_weight: f64,
     capability_weight: f64,
     learned_weight: f64,
     priority_weight: f64,
     context_weight: f64,
+    semantic_weight: f64,
+    confidence_sharpening: f64,
+}
+
+/// Apply sigmoid sharpening to spread raw confidence scores apart.
+/// k=8.0: raw 0.30→~0.15, raw 0.50→~0.50, raw 0.65→~0.80
+fn sharpen_confidence(raw: f64, k: f64) -> f64 {
+    if k <= 0.0 {
+        return raw;
+    }
+    1.0 / (1.0 + (-k * (raw - 0.50)).exp())
+}
+
+/// Check if task text mentions swarm/team/coordination keywords.
+fn mentions_swarm(task: &str) -> bool {
+    let t = task.to_lowercase();
+    t.contains("swarm")
+        || t.contains("team")
+        || t.contains("coordinat")
+        || t.contains("consensus")
+        || t.contains("multi-agent")
+}
+
+/// Check if task text mentions workflow/pipeline keywords.
+fn mentions_workflow(task: &str) -> bool {
+    let t = task.to_lowercase();
+    t.contains("workflow")
+        || t.contains("pipeline")
+        || t.contains("automat")
+        || t.contains("sparc")
+        || t.contains("goal plan")
 }
 
 impl AgentRouter {
@@ -31,6 +63,12 @@ impl AgentRouter {
             learned_weight: sanitize(config.learned_weight),
             priority_weight: sanitize(config.priority_weight),
             context_weight: sanitize(config.context_weight),
+            semantic_weight: sanitize(config.semantic_weight),
+            confidence_sharpening: if config.confidence_sharpening.is_finite() {
+                config.confidence_sharpening
+            } else {
+                0.0
+            },
         }
     }
 
@@ -42,14 +80,29 @@ impl AgentRouter {
     /// - `agents`: available agent definitions to score
     /// - `learned_weights`: mapping of (task_pattern, agent_name) -> weight from learning system
     /// - `context`: optional session context for context-aware scoring
+    /// - `semantic_scores`: optional pre-computed semantic similarity scores per agent
     pub fn route(
         &self,
         task: &str,
         agents: &[&AgentDef],
         learned_weights: &HashMap<(String, String), f64>,
         context: Option<&RoutingContext>,
+        semantic_scores: Option<&HashMap<String, f64>>,
     ) -> Vec<RoutingResult> {
-        let mut results: Vec<RoutingResult> = agents
+        // Pre-filter agents by routing category
+        let want_swarm = mentions_swarm(task);
+        let want_workflow = mentions_workflow(task);
+
+        let filtered: Vec<&&AgentDef> = agents
+            .iter()
+            .filter(|agent| match agent.routing_category {
+                RoutingCategory::Core | RoutingCategory::Specialist => true,
+                RoutingCategory::SwarmOnly => want_swarm,
+                RoutingCategory::WorkflowOnly => want_workflow,
+            })
+            .collect();
+
+        let mut results: Vec<RoutingResult> = filtered
             .iter()
             .map(|agent| {
                 let pattern_score = self.compute_pattern_score(task, agent);
@@ -59,15 +112,21 @@ impl AgentRouter {
                 let context_score = context
                     .map(|ctx| self.compute_context_score(agent, ctx))
                     .unwrap_or(0.5);
+                let semantic_score = semantic_scores
+                    .and_then(|scores| scores.get(&agent.name).copied())
+                    .unwrap_or(0.0);
 
                 let raw_confidence = self.pattern_weight * pattern_score
                     + self.capability_weight * capability_score
                     + self.learned_weight * learned_score
                     + self.priority_weight * priority_score
-                    + self.context_weight * context_score;
-                // Clamp to [0.0, 1.0] and guard against NaN/Inf
-                let confidence = if raw_confidence.is_finite() {
-                    raw_confidence.clamp(0.0, 1.0)
+                    + self.context_weight * context_score
+                    + self.semantic_weight * semantic_score;
+
+                // Apply sigmoid sharpening, then clamp
+                let sharpened = sharpen_confidence(raw_confidence, self.confidence_sharpening);
+                let confidence = if sharpened.is_finite() {
+                    sharpened.clamp(0.0, 1.0)
                 } else {
                     0.0
                 };
@@ -81,6 +140,7 @@ impl AgentRouter {
                         learned_score,
                         priority_score,
                         context_score,
+                        semantic_score,
                     },
                 }
             })
@@ -325,6 +385,7 @@ mod tests {
             patterns: patterns.iter().map(|s| s.to_string()).collect(),
             priority,
             color: None,
+            routing_category: RoutingCategory::Core,
             body: String::new(),
             source: AgentSource::BuiltIn,
         }
@@ -338,7 +399,7 @@ mod tests {
         let agents: Vec<&AgentDef> = vec![&agent];
         let learned = HashMap::new();
 
-        let results = router.route("test the login flow", &agents, &learned, None);
+        let results = router.route("test the login flow", &agents, &learned, None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].breakdown.pattern_score, 1.0);
     }
@@ -351,7 +412,7 @@ mod tests {
         let agents: Vec<&AgentDef> = vec![&agent];
         let learned = HashMap::new();
 
-        let results = router.route("test the login flow", &agents, &learned, None);
+        let results = router.route("test the login flow", &agents, &learned, None, None);
         assert!((results[0].breakdown.pattern_score - 0.5).abs() < 0.01);
     }
 
@@ -362,7 +423,7 @@ mod tests {
         let agents: Vec<&AgentDef> = vec![&agent];
         let learned = HashMap::new();
 
-        let results = router.route("test the login flow", &agents, &learned, None);
+        let results = router.route("test the login flow", &agents, &learned, None, None);
         assert_eq!(results[0].breakdown.pattern_score, 0.0);
     }
 
@@ -374,17 +435,17 @@ mod tests {
         let agents: Vec<&AgentDef> = vec![&sync_agent];
         let learned = HashMap::new();
 
-        let results = router.route("fix async handler", &agents, &learned, None);
+        let results = router.route("fix async handler", &agents, &learned, None, None);
         assert_eq!(results[0].breakdown.pattern_score, 0.0);
 
         // But should match when "sync" is a standalone word
-        let results = router.route("sync the database", &agents, &learned, None);
+        let results = router.route("sync the database", &agents, &learned, None, None);
         assert_eq!(results[0].breakdown.pattern_score, 1.0);
 
         // "document" should match "documentation" (leading boundary, suffix allowed)
         let doc_agent = make_agent("doc", &[], &["document"], Priority::Normal);
         let agents: Vec<&AgentDef> = vec![&doc_agent];
-        let results = router.route("write documentation", &agents, &learned, None);
+        let results = router.route("write documentation", &agents, &learned, None, None);
         assert_eq!(results[0].breakdown.pattern_score, 1.0);
     }
 
@@ -400,7 +461,7 @@ mod tests {
         let agents: Vec<&AgentDef> = vec![&agent];
         let learned = HashMap::new();
 
-        let results = router.route("review this rust code", &agents, &learned, None);
+        let results = router.route("review this rust code", &agents, &learned, None, None);
         let cap_score = results[0].breakdown.capability_score;
         // "rust" and "review" should match out of 3 capabilities
         assert!((cap_score - 2.0 / 3.0).abs() < 0.01);
@@ -414,7 +475,7 @@ mod tests {
         let agents: Vec<&AgentDef> = vec![&low, &high];
         let learned = HashMap::new();
 
-        let results = router.route("test something", &agents, &learned, None);
+        let results = router.route("test something", &agents, &learned, None, None);
         assert_eq!(results[0].agent_name, "high");
         assert_eq!(results[1].agent_name, "low");
     }
@@ -429,7 +490,7 @@ mod tests {
         let mut learned = HashMap::new();
         learned.insert(("deploy".to_string(), "agent-b".to_string()), 0.9);
 
-        let results = router.route("deploy the service", &agents, &learned, None);
+        let results = router.route("deploy the service", &agents, &learned, None, None);
         // agent-b should rank higher due to the learned weight
         assert_eq!(results[0].agent_name, "agent-b");
     }
@@ -440,7 +501,7 @@ mod tests {
         let agents: Vec<&AgentDef> = vec![];
         let learned = HashMap::new();
 
-        let results = router.route("anything", &agents, &learned, None);
+        let results = router.route("anything", &agents, &learned, None, None);
         assert!(results.is_empty());
     }
 
@@ -457,7 +518,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = router.route("fix a bug", &agents, &learned, Some(&context));
+        let results = router.route("fix a bug", &agents, &learned, Some(&context), None);
         // rust-dev should rank higher because we're editing .rs files
         assert_eq!(results[0].agent_name, "rust-dev");
     }
@@ -475,7 +536,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = router.route("write some code", &agents, &learned, Some(&context));
+        let results = router.route("write some code", &agents, &learned, Some(&context), None);
         // "coder" should get a continuity bonus
         assert_eq!(results[0].agent_name, "coder");
         assert!(results[0].breakdown.context_score > results[1].breakdown.context_score);
@@ -489,7 +550,7 @@ mod tests {
         let agents: Vec<&AgentDef> = vec![&agent_b, &agent_a];
         let learned = HashMap::new();
 
-        let results = router.route("anything", &agents, &learned, None);
+        let results = router.route("anything", &agents, &learned, None, None);
         // Same confidence → sorted alphabetically
         assert_eq!(results[0].agent_name, "alpha");
         assert_eq!(results[1].agent_name, "beta");
@@ -504,6 +565,8 @@ mod tests {
             learned_weight: f64::NEG_INFINITY,
             priority_weight: 0.5,
             context_weight: 0.5,
+            semantic_weight: 0.0,
+            confidence_sharpening: 0.0,
         };
         let router = AgentRouter::new(&config);
         // NaN/Inf weights should be sanitized to 0.0
@@ -515,7 +578,7 @@ mod tests {
         let agents: Vec<&AgentDef> = vec![&agent];
         let learned = HashMap::new();
 
-        let results = router.route("test task", &agents, &learned, None);
+        let results = router.route("test task", &agents, &learned, None, None);
         assert!(!results.is_empty());
         let confidence = results[0].confidence;
         assert!(
@@ -543,7 +606,7 @@ mod tests {
         let mut learned = HashMap::new();
         learned.insert(("test".to_string(), "perfect".to_string()), 1.0);
 
-        let results = router.route("test", &agents, &learned, None);
+        let results = router.route("test", &agents, &learned, None, None);
         assert!(results[0].confidence <= 1.0);
         assert!(results[0].confidence >= 0.0);
     }
@@ -555,5 +618,72 @@ mod tests {
         assert_eq!(ext_to_language("ts"), "typescript");
         assert_eq!(ext_to_language("tsx"), "typescript");
         assert_eq!(ext_to_language("unknown"), "unknown");
+    }
+
+    #[test]
+    fn test_sharpen_confidence() {
+        // Midpoint stays at 0.5
+        assert!((sharpen_confidence(0.5, 8.0) - 0.5).abs() < 0.01);
+        // Low raw → pushed lower
+        assert!(sharpen_confidence(0.3, 8.0) < 0.2);
+        // High raw → pushed higher
+        assert!(sharpen_confidence(0.65, 8.0) > 0.75);
+        // k=0 disables sharpening
+        assert!((sharpen_confidence(0.3, 0.0) - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_semantic_scores_boost_confidence() {
+        let router = AgentRouter::default();
+        let agent_a = make_agent("agent-a", &[], &[], Priority::Normal);
+        let agent_b = make_agent("agent-b", &[], &[], Priority::Normal);
+        let agents: Vec<&AgentDef> = vec![&agent_a, &agent_b];
+        let learned = HashMap::new();
+
+        let mut semantic = HashMap::new();
+        semantic.insert("agent-b".to_string(), 0.9);
+        semantic.insert("agent-a".to_string(), 0.1);
+
+        let results = router.route("anything", &agents, &learned, None, Some(&semantic));
+        // agent-b should rank higher due to semantic score
+        assert_eq!(results[0].agent_name, "agent-b");
+        assert!(results[0].breakdown.semantic_score > results[1].breakdown.semantic_score);
+    }
+
+    #[test]
+    fn test_agent_filtering_swarm_only() {
+        let router = AgentRouter::default();
+        let core_agent = make_agent("coder", &["code"], &[], Priority::Normal);
+        let mut swarm_agent = make_agent("swarm-lead", &["coordinate"], &[], Priority::Normal);
+        swarm_agent.routing_category = RoutingCategory::SwarmOnly;
+        let agents: Vec<&AgentDef> = vec![&core_agent, &swarm_agent];
+        let learned = HashMap::new();
+
+        // Normal task: swarm agent should be filtered out
+        let results = router.route("fix a bug in the parser", &agents, &learned, None, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].agent_name, "coder");
+
+        // Swarm task: swarm agent should be included
+        let results = router.route("coordinate team review", &agents, &learned, None, None);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_agent_filtering_workflow_only() {
+        let router = AgentRouter::default();
+        let core_agent = make_agent("coder", &["code"], &[], Priority::Normal);
+        let mut workflow_agent = make_agent("sparc", &["workflow"], &[], Priority::Normal);
+        workflow_agent.routing_category = RoutingCategory::WorkflowOnly;
+        let agents: Vec<&AgentDef> = vec![&core_agent, &workflow_agent];
+        let learned = HashMap::new();
+
+        // Normal task: workflow agent filtered out
+        let results = router.route("fix a bug", &agents, &learned, None, None);
+        assert_eq!(results.len(), 1);
+
+        // Workflow task: workflow agent included
+        let results = router.route("automate the deployment pipeline", &agents, &learned, None, None);
+        assert_eq!(results.len(), 2);
     }
 }

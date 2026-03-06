@@ -62,9 +62,35 @@ pub fn run() -> Result<()> {
 fn update_routing_weight(ctx: &super::HookContext, task_subject: &str, agent_name: &str) {
     let task_pattern = super::extract_task_pattern(task_subject);
 
-    // Record a success for this agent on this task pattern
+    // Record a success for this agent on this task pattern (old system)
     ctx.with_db("record_routing_success", |db| {
         db.record_routing_success(&task_pattern, agent_name)
+    });
+
+    // New system: record_routing_outcome with stored breakdown if available
+    ctx.with_db("record_routing_outcome", |db| {
+        let session = db.get_current_session()?.ok_or_else(|| {
+            flowforge_core::Error::Config("no current session".to_string())
+        })?;
+        let injections = db.get_injections_for_session(&session.id)?;
+        if let Some(routing_inj) = injections.iter().find(|i| i.injection_type == "routing") {
+            if let Some(ref metadata) = routing_inj.metadata {
+                if let Ok(breakdown) = serde_json::from_str::<flowforge_core::RoutingBreakdown>(metadata) {
+                    return db.record_routing_outcome(
+                        &session.id, agent_name, &task_pattern,
+                        breakdown.pattern_score, breakdown.capability_score,
+                        breakdown.learned_score, breakdown.priority_score,
+                        breakdown.context_score, breakdown.semantic_score,
+                        "success",
+                    );
+                }
+            }
+        }
+        // Fallback: record with zero scores
+        db.record_routing_outcome(
+            &session.id, agent_name, &task_pattern,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "success",
+        )
     });
 
     // Store routing embedding for similarity-based generalization
@@ -73,6 +99,8 @@ fn update_routing_weight(ctx: &super::HookContext, task_subject: &str, agent_nam
         let embedding = flowforge_memory::default_embedder(&config_for_embed);
         let vec = embedding.embed(&task_pattern);
         let source_id = format!("{}::{}", task_pattern, agent_name);
-        db.store_vector("routing", &source_id, &vec)
+        db.store_vector("routing", &source_id, &vec)?;
+        // Also store as routing_success for few-shot lookup
+        db.store_vector("routing_success", &source_id, &vec)
     });
 }

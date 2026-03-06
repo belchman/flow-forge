@@ -43,6 +43,7 @@ pub use types::{
     Priority,
     RiskLevel,
     RoutingBreakdown,
+    RoutingCategory,
     RoutingContext,
     RoutingResult,
     RoutingWeight,

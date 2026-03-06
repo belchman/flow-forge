@@ -441,6 +441,13 @@ enum WorkAction {
         /// Work item ID (prefix match supported)
         id: String,
     },
+    /// Add a comment to a work item (syncs to kanbus/beads)
+    Comment {
+        /// Work item ID (prefix match supported)
+        id: String,
+        /// Comment text
+        text: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -733,6 +740,7 @@ fn main() {
             WorkAction::Heartbeat { id } => commands::work::heartbeat(id.as_deref()),
             WorkAction::Get { id, json } => commands::work::get(&id, json),
             WorkAction::Delete { id } => commands::work::delete(&id),
+            WorkAction::Comment { id, text } => commands::work::comment(&id, &text),
         },
         Commands::Mailbox { action } => match action {
             MailboxAction::Send {

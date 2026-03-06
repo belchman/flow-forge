@@ -121,26 +121,33 @@ impl Default for AgentsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoutingConfig {
-    /// Weight for pattern-match signal. Range: 0.0..1.0. Default: 0.35.
+    /// Weight for pattern-match signal. Range: 0.0..1.0. Default: 0.30.
     pub pattern_weight: f64,
-    /// Weight for capability-match signal. Range: 0.0..1.0. Default: 0.25.
+    /// Weight for capability-match signal. Range: 0.0..1.0. Default: 0.20.
     pub capability_weight: f64,
     /// Weight for learned (historical success) signal. Range: 0.0..1.0. Default: 0.20.
     pub learned_weight: f64,
     /// Weight for agent priority ordering. Range: 0.0..1.0. Default: 0.05.
     pub priority_weight: f64,
-    /// Weight for contextual cues (file types, recent edits). Range: 0.0..1.0. Default: 0.15.
+    /// Weight for contextual cues (file types, recent edits). Range: 0.0..1.0. Default: 0.10.
     pub context_weight: f64,
+    /// Weight for semantic (embedding) similarity. Range: 0.0..1.0. Default: 0.15.
+    pub semantic_weight: f64,
+    /// Sigmoid sharpening factor for confidence scores. Higher = sharper separation.
+    /// 0.0 disables sharpening. Default: 8.0.
+    pub confidence_sharpening: f64,
 }
 
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            pattern_weight: 0.35,
-            capability_weight: 0.25,
+            pattern_weight: 0.30,
+            capability_weight: 0.20,
             learned_weight: 0.20,
             priority_weight: 0.05,
-            context_weight: 0.15,
+            context_weight: 0.10,
+            semantic_weight: 0.15,
+            confidence_sharpening: 8.0,
         }
     }
 }
@@ -491,7 +498,7 @@ pub struct PluginsConfig {
 impl FlowForgeConfig {
     /// Load config from a TOML file, falling back to defaults
     pub fn load(path: &Path) -> crate::Result<Self> {
-        let config = if path.exists() {
+        let mut config = if path.exists() {
             let content = std::fs::read_to_string(path)?;
             toml::from_str(&content)?
         } else {
@@ -511,8 +518,10 @@ impl FlowForgeConfig {
         Ok(())
     }
 
-    /// Validate config for common misconfigurations
-    pub fn validate(&self) -> crate::Result<()> {
+    /// Validate config for common misconfigurations.
+    /// Auto-normalizes routing weights if they don't sum to ~1.0 (e.g. old configs
+    /// without semantic_weight that get the new default added on top).
+    pub fn validate(&mut self) -> crate::Result<()> {
         let ws = &self.work_tracking.work_stealing;
         if ws.abandon_threshold_mins <= ws.stale_threshold_mins {
             return Err(crate::Error::Config(
@@ -654,16 +663,35 @@ impl FlowForgeConfig {
         }
 
         // Cross-field: routing weights must sum to approximately 1.0
-        let r = &self.routing;
-        let weight_sum = r.pattern_weight
-            + r.capability_weight
-            + r.learned_weight
-            + r.priority_weight
-            + r.context_weight;
-        if (weight_sum - 1.0).abs() > 0.01 {
-            return Err(crate::Error::Config(format!(
-                "routing weights must sum to ~1.0, got {weight_sum:.4}"
-            )));
+        // Auto-normalize if they don't (common when upgrading from old 5-weight config)
+        {
+            let r = &self.routing;
+            let weight_sum = r.pattern_weight
+                + r.capability_weight
+                + r.learned_weight
+                + r.priority_weight
+                + r.context_weight
+                + r.semantic_weight;
+            if (weight_sum - 1.0).abs() > 0.01 {
+                if weight_sum > 0.0 && weight_sum.is_finite() {
+                    // Auto-normalize
+                    self.routing.pattern_weight /= weight_sum;
+                    self.routing.capability_weight /= weight_sum;
+                    self.routing.learned_weight /= weight_sum;
+                    self.routing.priority_weight /= weight_sum;
+                    self.routing.context_weight /= weight_sum;
+                    self.routing.semantic_weight /= weight_sum;
+                } else {
+                    return Err(crate::Error::Config(format!(
+                        "routing weights must sum to ~1.0, got {weight_sum:.4}"
+                    )));
+                }
+            }
+        }
+        if self.routing.confidence_sharpening < 0.0 {
+            return Err(crate::Error::Config(
+                "confidence_sharpening must be >= 0.0".to_string(),
+            ));
         }
 
         // Cross-field: trust_ask_threshold must be >= trust_initial_score
@@ -722,7 +750,7 @@ mod tests {
 
     #[test]
     fn test_validate_valid_config() {
-        let config = FlowForgeConfig::default();
+        let mut config = FlowForgeConfig::default();
         assert!(config.validate().is_ok());
     }
 
@@ -916,7 +944,8 @@ log_level = "debug"
             + config.capability_weight
             + config.learned_weight
             + config.priority_weight
-            + config.context_weight;
+            + config.context_weight
+            + config.semantic_weight;
         assert!((sum - 1.0).abs() < 0.001);
     }
 
@@ -930,6 +959,7 @@ log_level = "debug"
         config.routing.learned_weight = 0.0;
         config.routing.priority_weight = 0.0;
         config.routing.context_weight = 0.0;
+        config.routing.semantic_weight = 0.0;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("routing weights"), "got: {err}");
     }

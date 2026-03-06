@@ -92,4 +92,7 @@ pub struct ContextInjection {
     pub reference_id: String,
     pub similarity: Option<f64>,
     pub timestamp: String,
+    /// Optional JSON metadata (e.g. serialized RoutingBreakdown for routing injections)
+    #[serde(default)]
+    pub metadata: Option<String>,
 }

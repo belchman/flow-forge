@@ -111,6 +111,13 @@ pub fn close(db: &MemoryDb, config: &FlowForgeConfig, p: &Value) -> flowforge_co
     Ok(json!({"status": "ok", "id": id}))
 }
 
+pub fn comment(db: &MemoryDb, config: &FlowForgeConfig, p: &Value) -> flowforge_core::Result<Value> {
+    let id = p.require_str("id")?;
+    let text = p.require_str("text")?;
+    flowforge_core::work_tracking::add_comment(db, &config.work_tracking, id, "mcp", text)?;
+    Ok(json!({"status": "ok", "id": id}))
+}
+
 pub fn sync(db: &MemoryDb, config: &FlowForgeConfig) -> flowforge_core::Result<Value> {
     let pulled = flowforge_core::work_tracking::sync_from_backend(db, &config.work_tracking)?;
     let pushed = flowforge_core::work_tracking::push_to_backend(db, &config.work_tracking)?;

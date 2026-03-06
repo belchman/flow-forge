@@ -581,10 +581,10 @@ fn record_edit(input: &PostToolUseInput, db: &MemoryDb) -> Result<()> {
         .and_then(|e| e.to_str())
         .map(|s| s.to_string());
 
-    let session_id = db
-        .get_current_session()?
-        .map(|s| s.id)
-        .unwrap_or_else(|| "unknown".to_string());
+    let session_id = match db.get_current_session()? {
+        Some(s) => s.id,
+        None => return Ok(()), // No session — skip recording
+    };
 
     let edit = EditRecord {
         session_id: session_id.clone(),

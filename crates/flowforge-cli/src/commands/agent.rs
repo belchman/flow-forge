@@ -22,8 +22,9 @@ pub fn list() -> Result<()> {
 
     for agent in &agents {
         let priority = format!("{:?}", agent.priority);
-        let desc = if agent.description.len() > 38 {
-            format!("{}...", &agent.description[..35])
+        let desc = if agent.description.chars().count() > 38 {
+            let truncated: String = agent.description.chars().take(35).collect();
+            format!("{truncated}...")
         } else {
             agent.description.clone()
         };

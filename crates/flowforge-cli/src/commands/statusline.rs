@@ -40,6 +40,11 @@ pub fn run() -> Result<()> {
         .and_then(|v| v.as_f64())
         .map(|f| f as u32);
 
+    let session_cost: Option<f64> = stdin_data
+        .get("cost")
+        .and_then(|c| c.get("total_cost_usd"))
+        .and_then(|v| v.as_f64());
+
     let session_name: Option<&str> = stdin_data
         .get("session_name")
         .and_then(|v| v.as_str())
@@ -131,6 +136,19 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Session cost
+    if let Some(cost) = session_cost {
+        let cost_str = format!("${:.2}", cost);
+        let colored = if cost < 1.0 {
+            cost_str.green()
+        } else if cost < 5.0 {
+            cost_str.yellow()
+        } else {
+            cost_str.bright_red()
+        };
+        header_parts.push(colored.to_string());
+    }
+
     let sep = format!("  {}  ", SEP.dimmed());
     lines.push(header_parts.join(&sep));
 
@@ -197,6 +215,19 @@ pub fn run() -> Result<()> {
             let cps = db.list_checkpoints(sid).map(|c| c.len()).unwrap_or(0);
             parts.push(format!("{} cp", cps).dimmed().to_string());
 
+            // Hook health: called_ok / total_configured
+            let hook_health = compute_hook_health(db, sid);
+            if hook_health.total > 0 {
+                let h_str = format!("{}/{} hooks", hook_health.ok, hook_health.total);
+                if hook_health.ok == hook_health.total {
+                    parts.push(h_str.green().to_string());
+                } else if hook_health.ok as f64 / hook_health.total as f64 >= 0.8 {
+                    parts.push(h_str.yellow().to_string());
+                } else {
+                    parts.push(h_str.red().to_string());
+                }
+            }
+
             // Session activity (with separator only when there's content)
             let mut activity = Vec::new();
             if session.edits > 0 {
@@ -220,21 +251,25 @@ pub fn run() -> Result<()> {
     if let Some(ref db) = db {
         let mut line3_parts: Vec<String> = Vec::new();
 
-        // Agents (only when active)
+        // Agents: live/total_spawned (names)
         let current_session_id = db.get_current_session().ok().flatten().map(|s| s.id);
-        let (active_count, idle_count, agent_names) =
-            get_agent_summary(db, current_session_id.as_deref());
-        let total_agents = active_count + idle_count;
-        if total_agents > 0 {
-            line3_parts.push(format!(
-                "{} agents ({})",
-                format!("{}", total_agents).bright_green(),
-                if !agent_names.is_empty() {
-                    agent_names.join(" ")
-                } else {
-                    "--".dimmed().to_string()
-                }
-            ));
+        let agents = get_agent_summary(db, current_session_id.as_deref());
+        let live = agents.active + agents.idle;
+        if agents.total_spawned > 0 {
+            let count_str = if live > 0 {
+                format!("{}/{} agents", live, agents.total_spawned)
+                    .bright_green()
+                    .to_string()
+            } else {
+                format!("0/{} agents", agents.total_spawned)
+                    .dimmed()
+                    .to_string()
+            };
+            if !agents.names.is_empty() {
+                line3_parts.push(format!("{} ({})", count_str, agents.names.join(" ")));
+            } else {
+                line3_parts.push(count_str);
+            }
         }
 
         // Unread mail
@@ -247,20 +282,36 @@ pub fn run() -> Result<()> {
             }
         }
 
-        // Work items
-        let wip =
-            db.count_work_items_by_status(flowforge_core::WorkStatus::InProgress).unwrap_or(0);
-        let pending =
-            db.count_work_items_by_status(flowforge_core::WorkStatus::Pending).unwrap_or(0);
+        // Work items (with title of first active/pending item)
+        let wip_items = db
+            .list_work_items(&flowforge_core::WorkFilter {
+                status: Some(flowforge_core::WorkStatus::InProgress),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        let pending_items = db
+            .list_work_items(&flowforge_core::WorkFilter {
+                status: Some(flowforge_core::WorkStatus::Pending),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        let wip = wip_items.len();
+        let pending = pending_items.len();
         if wip > 0 || pending > 0 {
+            // Show title of the most relevant work item
+            let lead_item = wip_items.first().or(pending_items.first());
+            if let Some(item) = lead_item {
+                let title = truncate_str(&item.title, 35);
+                line3_parts.push(title.bright_cyan().to_string());
+            }
             let mut w = Vec::new();
             if wip > 0 {
-                w.push(format!("{} work active", wip));
+                w.push(format!("{} active", wip));
             }
             if pending > 0 {
-                w.push(format!("{} work pending", pending));
+                w.push(format!("{} pending", pending));
             }
-            line3_parts.push(w.join("  ").bright_blue().to_string());
+            line3_parts.push(w.join(" ").bright_blue().to_string());
         }
 
         // Warnings
@@ -307,6 +358,7 @@ pub fn print_legend() -> Result<()> {
     println!("  op4.6        Model name (Opus 4.6, Sonnet 4.6, etc.)");
     println!("  ctx 23%      Context window usage (green<50 cyan<70 yellow<85 red)");
     println!("  5m           Session duration");
+    println!("  $1.23        Session cost (green<$1 yellow<$5 red)");
     println!();
 
     println!("{}", "INTELLIGENCE + SESSION LINE".bold());
@@ -316,15 +368,17 @@ pub fn print_legend() -> Result<()> {
     println!("  trust N%     Guidance trust score (green>=80 yellow>=50 red)");
     println!("  N errs       Distinct tool failures this session (green=0 red>0)");
     println!("  N cp         Checkpoint count (rollback safety points)");
+    println!("  N/M hooks    Hooks working / total configured (green=all yellow>=80% red)");
     println!("  N edits      File edits this session");
     println!("  N cmds       Commands run this session");
     println!();
 
     println!("{}", "WORK + AGENTS LINE (shown when applicable)".bold());
-    println!("  N agents     Active/idle agents with shortened names");
+    println!("  N/M agents   Live / total spawned agents (with shortened names)");
     println!("  N mail       Unread co-agent messages");
-    println!("  N work active   In-progress work items");
-    println!("  N work pending  Pending work items");
+    println!("  title…       Title of lead work item (truncated)");
+    println!("  N active     In-progress work items");
+    println!("  N pending    Pending work items");
     println!("  !! stale     Stealable work items (warning)");
     println!(
         "  !! {}    Hook error log not empty (warning)",
@@ -396,45 +450,55 @@ fn parse_git_porcelain(output: &str) -> (u32, u32, u32) {
     (staged, modified, untracked)
 }
 
-/// Get agent summary: (active_count, idle_count, formatted_names)
+struct AgentSummary {
+    active: usize,
+    idle: usize,
+    total_spawned: usize,
+    names: Vec<String>,
+}
+
+/// Get agent summary for the session.
 /// When parent_session_id is provided, shows agents from that session and
 /// their sub-agents (team lead children) via recursive query.
-fn get_agent_summary(
-    db: &MemoryDb,
-    parent_session_id: Option<&str>,
-) -> (usize, usize, Vec<String>) {
+fn get_agent_summary(db: &MemoryDb, parent_session_id: Option<&str>) -> AgentSummary {
     // Clean up orphaned agent sessions before display
     let _ = db.cleanup_orphaned_agent_sessions();
 
-    let agents = if let Some(sid) = parent_session_id {
-        db.get_agent_sessions_recursive(sid)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|a| a.ended_at.is_none())
-            .collect()
+    let all_agents = if let Some(sid) = parent_session_id {
+        db.get_agent_sessions_recursive(sid).unwrap_or_default()
     } else {
         db.get_active_agent_sessions().unwrap_or_default()
     };
-    let active: Vec<_> = agents
+
+    let total_spawned = all_agents.len();
+    let live: Vec<_> = all_agents
+        .into_iter()
+        .filter(|a| a.ended_at.is_none())
+        .collect();
+
+    let active: Vec<_> = live
         .iter()
         .filter(|a| a.status == AgentSessionStatus::Active)
         .collect();
-    let idle: Vec<_> = agents
+    let idle: Vec<_> = live
         .iter()
         .filter(|a| a.status == AgentSessionStatus::Idle)
         .collect();
 
     let mut names = Vec::new();
     for a in &active {
-        let name = shorten_agent_name(&a.agent_type);
-        names.push(name.bold().green().to_string());
+        names.push(shorten_agent_name(&a.agent_type).bold().green().to_string());
     }
     for a in &idle {
-        let name = shorten_agent_name(&a.agent_type);
-        names.push(name.dimmed().to_string());
+        names.push(shorten_agent_name(&a.agent_type).dimmed().to_string());
     }
 
-    (active.len(), idle.len(), names)
+    AgentSummary {
+        active: active.len(),
+        idle: idle.len(),
+        total_spawned,
+        names,
+    }
 }
 
 /// Shorten agent type names for compact display
@@ -452,6 +516,65 @@ fn shorten_model(model: &str) -> String {
         s if s.contains("sonnet-3.5") || s.contains("sonnet-3-5") => "sn3.5".to_string(),
         s if s.contains("haiku-3.5") || s.contains("haiku-3-5") => "hk3.5".to_string(),
         _ => model.to_string(),
+    }
+}
+
+struct HookHealth {
+    total: usize, // configured hook event types
+    ok: usize,    // called this session with zero errors
+}
+
+fn compute_hook_health(db: &MemoryDb, session_id: &str) -> HookHealth {
+    // Count configured hooks from settings.json
+    let total = count_configured_hooks();
+
+    // Get session metrics to find which hooks have been called and which errored
+    let metrics = db.get_session_metrics(session_id).unwrap_or_default();
+
+    let mut called: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut errored: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (name, value) in &metrics {
+        if let Some(hook) = name.strip_prefix("hook_calls:") {
+            if *value > 0.0 {
+                called.insert(hook.to_string());
+            }
+        }
+        if let Some(hook) = name.strip_prefix("hook_errors:") {
+            if *value > 0.0 {
+                errored.insert(hook.to_string());
+            }
+        }
+    }
+
+    let ok = called.iter().filter(|h| !errored.contains(*h)).count();
+    HookHealth { total, ok }
+}
+
+fn count_configured_hooks() -> usize {
+    let settings_path = FlowForgeConfig::project_dir()
+        .parent()
+        .unwrap_or(".".as_ref())
+        .join(".claude/settings.json");
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let val: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    val.get("hooks")
+        .and_then(|h| h.as_object())
+        .map(|obj| obj.len())
+        .unwrap_or(0)
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max - 1])
     }
 }
 

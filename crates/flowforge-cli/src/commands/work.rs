@@ -578,6 +578,21 @@ pub fn delete(id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn comment(id: &str, text: &str) -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    let full_id = resolve_id(&db, id)?;
+    work_tracking::add_comment(&db, &config.work_tracking, &full_id, "user", text)?;
+
+    println!(
+        "{} Comment added to {}",
+        "✓".green(),
+        &id[..8.min(id.len())]
+    );
+    Ok(())
+}
+
 /// Resolve a partial ID to a full work item ID.
 fn resolve_id(db: &MemoryDb, partial: &str) -> Result<String> {
     // Try exact match first

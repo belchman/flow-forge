@@ -23,13 +23,14 @@ impl MemoryDb {
         injection_type: &str,
         reference_id: Option<&str>,
         similarity: Option<f64>,
+        metadata: Option<&str>,
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         self.conn
             .execute(
-                "INSERT INTO context_injections (session_id, trajectory_id, injection_type, reference_id, similarity, timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![session_id, trajectory_id, injection_type, reference_id, similarity, now],
+                "INSERT INTO context_injections (session_id, trajectory_id, injection_type, reference_id, similarity, timestamp, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![session_id, trajectory_id, injection_type, reference_id, similarity, now, metadata],
             )
             .sq()?;
         Ok(self.conn.last_insert_rowid())
@@ -39,7 +40,7 @@ impl MemoryDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, session_id, trajectory_id, injection_type, reference_id, similarity, timestamp
+                "SELECT id, session_id, trajectory_id, injection_type, reference_id, similarity, timestamp, metadata
                  FROM context_injections WHERE session_id = ?1 ORDER BY id ASC",
             )
             .sq()?;
@@ -53,6 +54,7 @@ impl MemoryDb {
                     reference_id: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                     similarity: row.get(5)?,
                     timestamp: row.get(6)?,
+                    metadata: row.get(7)?,
                 })
             })
             .sq()?;

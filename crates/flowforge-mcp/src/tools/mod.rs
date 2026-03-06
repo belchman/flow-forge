@@ -126,6 +126,7 @@ impl ToolRegistry {
             "work_update" => self.use_db(work::update, params),
             "work_log" => self.use_db(|db, _, p| work::log(db, p), params),
             "work_close" => self.use_db(work::close, params),
+            "work_comment" => self.use_db(work::comment, params),
             "work_sync" => self.use_db(|db, c, _| work::sync(db, c), params),
             "work_load" => self.use_db(|db, _, _| work::load(db), params),
             "work_status" => self.use_db(|db, _, _| work::status(db), params),
@@ -557,6 +558,14 @@ impl ToolRegistry {
             .build();
         tools
             .tool(
+                "work_comment",
+                "Add a comment to a work item (syncs to kanbus/beads backend)",
+            )
+            .required_str("id", "Work item ID")
+            .required_str("text", "Comment text")
+            .build();
+        tools
+            .tool(
                 "work_sync",
                 "Sync work items with external backend (kanbus/beads/claude_tasks)",
             )
@@ -752,9 +761,9 @@ mod tests {
     use crate::params::ParamExt;
 
     #[test]
-    fn test_registry_has_67_tools() {
+    fn test_registry_has_68_tools() {
         let registry = ToolRegistry::new();
-        assert_eq!(registry.list().len(), 67);
+        assert_eq!(registry.list().len(), 68);
     }
 
     #[test]
@@ -1074,6 +1083,7 @@ mod tests {
             "work_steal",
             "work_heartbeat",
             "work_close",
+            "work_comment",
             "work_sync",
             "work_load",
             "work_stealable",

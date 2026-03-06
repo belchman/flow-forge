@@ -320,6 +320,8 @@ impl MemoryDb {
 
         // Effectiveness tracking migration
         self.migrate_add_column("context_injections", "effectiveness", "TEXT")?;
+        // Routing breakdown metadata (stores serialized RoutingBreakdown JSON)
+        self.migrate_add_column("context_injections", "metadata", "TEXT")?;
 
         // Pattern effectiveness table + columns
         self.conn
@@ -418,7 +420,8 @@ impl MemoryDb {
                 reference_id TEXT,
                 similarity REAL,
                 timestamp TEXT NOT NULL,
-                effectiveness TEXT
+                effectiveness TEXT,
+                metadata TEXT
             );
             INSERT OR IGNORE INTO context_injections_v7 SELECT * FROM context_injections;
             DROP TABLE context_injections;

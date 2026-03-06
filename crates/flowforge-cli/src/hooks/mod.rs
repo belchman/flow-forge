@@ -307,13 +307,15 @@ pub fn run_session_learning(ctx: &HookContext, session: &flowforge_core::Session
             let _ = db.rate_session_injections(&sid, rating);
         }
 
-        // Feed verdict back to routing weights
+        // Feed verdict back to routing weights (old + new systems)
         if let (Some(ref agent_name), Some(ref task_desc)) =
             (&trajectory.agent_name, &trajectory.task_description)
         {
             let pattern = extract_task_pattern(task_desc);
             if !pattern.is_empty() {
                 use flowforge_core::trajectory::TrajectoryVerdict;
+
+                // Old system: scalar routing weights (backward compat)
                 match result.verdict {
                     TrajectoryVerdict::Success => {
                         let _ = db.record_routing_success(&pattern, agent_name);
@@ -323,11 +325,66 @@ pub fn run_session_learning(ctx: &HookContext, session: &flowforge_core::Session
                     }
                     TrajectoryVerdict::Partial => {}
                 }
+
+                // New system: record_routing_outcome with full signal breakdown
+                let outcome_str = match result.verdict {
+                    TrajectoryVerdict::Success => "success",
+                    TrajectoryVerdict::Failure => "failure",
+                    TrajectoryVerdict::Partial => "partial",
+                };
+
+                // Look up stored RoutingBreakdown from context_injection metadata
+                if let Ok(injections) = db.get_injections_for_session(&sid) {
+                    if let Some(routing_inj) = injections.iter().find(|i| i.injection_type == "routing") {
+                        if let Some(ref metadata) = routing_inj.metadata {
+                            if let Ok(breakdown) = serde_json::from_str::<flowforge_core::RoutingBreakdown>(metadata) {
+                                let _ = db.record_routing_outcome(
+                                    &sid,
+                                    agent_name,
+                                    &pattern,
+                                    breakdown.pattern_score,
+                                    breakdown.capability_score,
+                                    breakdown.learned_score,
+                                    breakdown.priority_score,
+                                    breakdown.context_score,
+                                    breakdown.semantic_score,
+                                    outcome_str,
+                                );
+                            }
+                        } else {
+                            // No breakdown stored — record with zero scores
+                            let _ = db.record_routing_outcome(
+                                &sid, agent_name, &pattern,
+                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                outcome_str,
+                            );
+                        }
+                    }
+                }
+
+                // Tier 5B: Store outcome-aware routing vectors
                 let config_for_embed = flowforge_core::config::PatternsConfig::default();
                 let embedding = flowforge_memory::default_embedder(&config_for_embed);
                 let vec = embedding.embed(&pattern);
                 let source_id = format!("{}::{}", pattern, agent_name);
                 let _ = db.store_vector("routing", &source_id, &vec);
+
+                // Store as routing_success or routing_failure for few-shot lookup
+                let outcome_source = match result.verdict {
+                    TrajectoryVerdict::Success => "routing_success",
+                    TrajectoryVerdict::Failure => "routing_failure",
+                    TrajectoryVerdict::Partial => "routing",
+                };
+                if outcome_source != "routing" {
+                    let _ = db.store_vector(outcome_source, &source_id, &vec);
+                }
+
+                // Tier 1C: Trigger adaptive weight recomputation if enough data
+                if let Ok(count) = db.count_routing_outcomes() {
+                    if count >= 10 {
+                        let _ = db.compute_adaptive_weights(30);
+                    }
+                }
             }
         }
 

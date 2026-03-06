@@ -13,6 +13,9 @@ pub struct AgentDef {
     pub priority: Priority,
     #[serde(default)]
     pub color: Option<String>,
+    /// Routing category for pre-filtering during routing
+    #[serde(default)]
+    pub routing_category: RoutingCategory,
     /// Full markdown body (after frontmatter)
     #[serde(skip)]
     pub body: String,
@@ -86,6 +89,23 @@ pub struct RoutingBreakdown {
     pub priority_score: f64,
     #[serde(default)]
     pub context_score: f64,
+    #[serde(default)]
+    pub semantic_score: f64,
+}
+
+/// Category for pre-filtering agents during routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoutingCategory {
+    /// General-purpose agents useful for everyday tasks
+    #[default]
+    Core,
+    /// Domain-specific agents for targeted tasks
+    Specialist,
+    /// Agents designed for multi-agent coordination only
+    SwarmOnly,
+    /// Agents for structured workflows/pipelines
+    WorkflowOnly,
 }
 
 /// A capability discovered through observing agent success/failure patterns.
