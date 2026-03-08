@@ -203,6 +203,79 @@ impl MemoryDb {
         rows.collect::<std::result::Result<Vec<_>, _>>().sq()
     }
 
+    /// Search patterns by keyword overlap with the prompt.
+    /// Returns patterns whose content shares words with the query, ranked by match quality.
+    pub fn search_patterns_by_keywords(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ShortTermPattern>> {
+        // Extract meaningful keywords (4+ chars, not stop words, lowercased)
+        const STOP_WORDS: &[&str] = &[
+            "the", "this", "that", "with", "from", "into", "about", "have", "been",
+            "were", "will", "just", "should", "would", "could", "also", "need", "want",
+            "make", "like", "some", "more", "very", "when", "then", "than", "only",
+            "each", "does", "done", "here", "there", "what", "your", "they", "them",
+        ];
+        let keywords: Vec<String> = query
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .filter(|w| w.len() >= 4 && !STOP_WORDS.contains(&w.as_str()))
+            .collect();
+        if keywords.is_empty() {
+            return self.get_top_patterns(limit);
+        }
+
+        // Build SQL LIKE conditions for keyword matching
+        let conditions: Vec<String> = keywords
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("LOWER(content) LIKE ?{}", i + 1))
+            .collect();
+        let where_clause = conditions.join(" OR ");
+
+        // Search both short-term and long-term patterns, prioritizing long-term (proven)
+        let sql = format!(
+            "SELECT id, content, category, confidence, usage_count, created_at, last_used, embedding_id
+             FROM (
+               SELECT id, content, category, confidence, usage_count, created_at, last_used, embedding_id
+               FROM patterns_long WHERE ({0})
+               UNION ALL
+               SELECT id, content, category, confidence, usage_count, created_at, last_used, embedding_id
+               FROM patterns_short WHERE ({0})
+             )
+             ORDER BY confidence DESC, usage_count DESC
+             LIMIT ?{1}",
+            where_clause,
+            keywords.len() + 1
+        );
+
+        let mut stmt = self.conn.prepare(&sql).sq()?;
+        let like_params: Vec<String> = keywords.iter().map(|k| format!("%{}%", k)).collect();
+        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+        for p in &like_params {
+            params_vec.push(p as &dyn rusqlite::types::ToSql);
+        }
+        let limit_val = limit as i64;
+        params_vec.push(&limit_val);
+
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
+                Ok(ShortTermPattern {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    category: row.get(2)?,
+                    confidence: row.get(3)?,
+                    usage_count: row.get(4)?,
+                    created_at: parse_datetime(row.get::<_, String>(5)?),
+                    last_used: parse_datetime(row.get::<_, String>(6)?),
+                    embedding_id: row.get(7)?,
+                })
+            })
+            .sq()?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().sq()
+    }
+
     // ── Patterns (Long-term) ──
 
     pub fn store_pattern_long(&self, pattern: &LongTermPattern) -> Result<()> {

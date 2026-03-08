@@ -515,7 +515,7 @@ pub fn vectorize(source: Option<&str>, limit: usize, dry_run: bool) -> Result<()
 
     let sources: Vec<&str> = match source {
         Some(s) => vec![s],
-        None => vec!["error", "work_item", "trajectory", "conversation"],
+        None => vec!["error", "work_item", "trajectory", "conversation", "code_file", "project_intel"],
     };
 
     let mut total_vectorized = 0u64;
@@ -683,9 +683,84 @@ pub fn vectorize(source: Option<&str>, limit: usize, dry_run: bool) -> Result<()
                     total_vectorized += embedded;
                 }
             }
+            "code_file" => {
+                let count = db.count_unvectorized_code_entries()?;
+                if dry_run {
+                    println!(
+                        "  {} code files to vectorize: {}",
+                        "→".dimmed(),
+                        count
+                    );
+                    continue;
+                }
+                if count == 0 {
+                    continue;
+                }
+                let entries = db.list_code_entries(limit)?;
+                let mut embedded = 0u64;
+                for entry in &entries {
+                    if entry.embedding_id.is_some() {
+                        continue;
+                    }
+                    let vec = embedder.embed(&entry.summary);
+                    if let Ok(eid) = db.store_vector("code_file", &entry.file_path, &vec) {
+                        let _ = db.update_code_entry_embedding(&entry.file_path, eid);
+                        embedded += 1;
+                        if embedded as usize >= limit {
+                            break;
+                        }
+                    }
+                }
+                if embedded > 0 {
+                    println!(
+                        "  {} Vectorized {} code files",
+                        "✓".green(),
+                        embedded
+                    );
+                    total_vectorized += embedded;
+                }
+            }
+            "project_intel" => {
+                let count = db.count_unvectorized_intelligence()?;
+                if dry_run {
+                    println!(
+                        "  {} intelligence sections to vectorize: {}",
+                        "→".dimmed(),
+                        count
+                    );
+                    continue;
+                }
+                if count == 0 {
+                    continue;
+                }
+                let sections = db.list_intelligence_sections()?;
+                let mut embedded = 0u64;
+                for section in &sections {
+                    if section.embedding_id.is_some() {
+                        continue;
+                    }
+                    let content = format!("{}: {}", section.section_title, section.content);
+                    let vec = embedder.embed(&content);
+                    if let Ok(eid) = db.store_vector("project_intel", &section.section_key, &vec) {
+                        let _ = db.update_intelligence_embedding(&section.section_key, eid);
+                        embedded += 1;
+                        if embedded as usize >= limit {
+                            break;
+                        }
+                    }
+                }
+                if embedded > 0 {
+                    println!(
+                        "  {} Vectorized {} intelligence sections",
+                        "✓".green(),
+                        embedded
+                    );
+                    total_vectorized += embedded;
+                }
+            }
             other => {
                 return Err(flowforge_core::Error::InvalidInput(format!(
-                    "Unknown source type '{}'. Use: error, work_item, trajectory, conversation",
+                    "Unknown source type '{}'. Use: error, work_item, trajectory, conversation, code_file, project_intel",
                     other
                 )));
             }
@@ -726,5 +801,86 @@ pub fn judge(id: &str) -> Result<()> {
     println!("  Confidence: {:.2}", result.confidence);
     println!("  Reason: {}", result.reason);
 
+    // Distill strategy patterns from successful trajectories
+    if result.verdict == flowforge_core::trajectory::TrajectoryVerdict::Success {
+        if let Ok(Some(pattern)) = judge.distill(id) {
+            println!("  Distilled: {}", pattern.chars().take(80).collect::<String>());
+        }
+    }
+
+    Ok(())
+}
+
+pub fn judge_all() -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = MemoryDb::open(&config.db_path())?;
+
+    use flowforge_memory::trajectory::TrajectoryJudge;
+    let judge_tool = TrajectoryJudge::new(&db, &config.patterns);
+
+    let trajectories = db.list_trajectories(None, Some("completed"), 1000)?;
+    if trajectories.is_empty() {
+        println!("No completed trajectories to judge.");
+        return Ok(());
+    }
+
+    println!("Judging {} completed trajectory(ies)...", trajectories.len());
+
+    let mut judged = 0u32;
+    let mut distilled = 0u32;
+    for t in &trajectories {
+        if let Ok(result) = judge_tool.judge(&t.id) {
+            judged += 1;
+            if result.verdict == flowforge_core::trajectory::TrajectoryVerdict::Success {
+                if let Ok(Some(_)) = judge_tool.distill(&t.id) {
+                    distilled += 1;
+                }
+            }
+        }
+    }
+
+    println!("{} Judged {} trajectory(ies), distilled {} pattern(s)", "✓".green(), judged, distilled);
+    Ok(())
+}
+
+pub fn distill_all() -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = MemoryDb::open(&config.db_path())?;
+
+    use flowforge_memory::trajectory::TrajectoryJudge;
+    let judge_tool = TrajectoryJudge::new(&db, &config.patterns);
+
+    // Process already-judged successful trajectories
+    let trajectories = db.list_trajectories(None, Some("judged"), 1000)?;
+    let successful: Vec<_> = trajectories
+        .iter()
+        .filter(|t| t.verdict == Some(flowforge_core::trajectory::TrajectoryVerdict::Success))
+        .collect();
+
+    if successful.is_empty() {
+        println!("No successful trajectories to distill.");
+        return Ok(());
+    }
+
+    println!("Distilling {} successful trajectory(ies)...", successful.len());
+    let mut distilled = 0u32;
+    let mut skipped = 0u32;
+    for t in &successful {
+        match judge_tool.distill(&t.id) {
+            Ok(Some(content)) => {
+                println!("  {} {}", "✓".green(), content.chars().take(100).collect::<String>());
+                distilled += 1;
+            }
+            Ok(None) => skipped += 1,
+            Err(_) => skipped += 1,
+        }
+    }
+
+    println!(
+        "\n{} Distilled {} pattern(s), skipped {} (trivial/no-task)",
+        "✓".green(),
+        distilled,
+        skipped
+    );
     Ok(())
 }

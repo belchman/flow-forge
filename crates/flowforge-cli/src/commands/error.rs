@@ -114,6 +114,44 @@ pub fn find(error_text: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn backfill() -> Result<()> {
+    let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
+    let db = open_db(&config)?;
+
+    // Find all completed/judged trajectories with failure steps
+    let trajectories = db.list_trajectories_with_failures()?;
+
+    if trajectories.is_empty() {
+        println!("No trajectories with failures found for backfill.");
+        return Ok(());
+    }
+
+    println!("Scanning {} trajectory(ies) for error resolutions...", trajectories.len());
+
+    let mut total_resolutions = 0u32;
+    for (traj_id, session_id) in &trajectories {
+        match db.auto_detect_resolutions(session_id, traj_id) {
+            Ok(count) if count > 0 => {
+                println!("  {} Found {} resolution(s) in trajectory {}", "✓".green(), count, &traj_id[..8]);
+                total_resolutions += count;
+            }
+            _ => {}
+        }
+    }
+
+    if total_resolutions > 0 {
+        println!("\n{} Backfilled {} error resolution(s)", "✓".green(), total_resolutions);
+    } else {
+        println!("No new resolutions found. Error→success patterns need to exist in trajectory steps.");
+    }
+
+    // Show updated stats
+    let (fingerprints, resolutions, _) = db.get_error_stats()?;
+    println!("  Error patterns: {}, Known resolutions: {}", fingerprints, resolutions);
+
+    Ok(())
+}
+
 pub fn stats() -> Result<()> {
     let config = FlowForgeConfig::load(&FlowForgeConfig::config_path())?;
     let db = open_db(&config)?;

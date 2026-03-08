@@ -103,6 +103,26 @@ enum Commands {
         #[command(subcommand)]
         action: PluginAction,
     },
+    /// Index project code for codebase intelligence
+    Index {
+        /// Show what would be indexed without doing it
+        #[arg(long)]
+        dry_run: bool,
+        /// Show index statistics
+        #[arg(long)]
+        stats: bool,
+        /// Index a single file
+        #[arg(long)]
+        file: Option<String>,
+        /// Remove entries for deleted files
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Project intelligence generation and management
+    Intelligence {
+        #[command(subcommand)]
+        action: IntelligenceAction,
+    },
     /// View and modify FlowForge configuration
     Config {
         #[command(subcommand)]
@@ -288,6 +308,10 @@ enum LearnAction {
         /// Trajectory ID
         id: String,
     },
+    /// Judge all completed trajectories and distill strategy patterns
+    JudgeAll,
+    /// Distill all successful judged trajectories into patterns
+    DistillAll,
     /// Download semantic embedding model
     DownloadModel,
     /// Show topic clusters
@@ -512,6 +536,8 @@ enum ErrorAction {
     },
     /// Show error recovery statistics
     Stats,
+    /// Backfill error resolutions from existing trajectory data
+    Backfill,
 }
 
 #[derive(Subcommand)]
@@ -539,6 +565,39 @@ enum GuidanceAction {
         #[arg(long)]
         session: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum IntelligenceAction {
+    /// Auto-generate project intelligence from code index and project structure
+    Generate {
+        /// Regenerate even if intelligence already exists
+        #[arg(long)]
+        force: bool,
+        /// Only generate a specific section (e.g., "overview", "conventions")
+        #[arg(long)]
+        section: Option<String>,
+        /// Show what would be generated without storing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show intelligence sections
+    Show {
+        /// Show a specific section by key
+        #[arg(long)]
+        section: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export intelligence to a markdown file
+    Export {
+        /// Output file path (default: .flowforge/PROJECT_INTELLIGENCE.md)
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Show intelligence generation status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -696,6 +755,8 @@ fn main() {
             } => commands::learn::trajectories(session.as_deref(), status.as_deref(), limit),
             LearnAction::Trajectory { id } => commands::learn::trajectory(&id),
             LearnAction::Judge { id } => commands::learn::judge(&id),
+            LearnAction::JudgeAll => commands::learn::judge_all(),
+            LearnAction::DistillAll => commands::learn::distill_all(),
             LearnAction::DownloadModel => commands::learn::download_model(),
             LearnAction::Clusters => commands::learn::clusters(),
             LearnAction::TuneClusters => commands::learn::tune_clusters(),
@@ -779,6 +840,7 @@ fn main() {
             ErrorAction::List { limit } => commands::error::list(limit),
             ErrorAction::Find { error_text } => commands::error::find(&error_text),
             ErrorAction::Stats => commands::error::stats(),
+            ErrorAction::Backfill => commands::error::backfill(),
         },
         Commands::Guidance { action } => match action {
             GuidanceAction::Rules => commands::guidance::rules(),
@@ -787,6 +849,20 @@ fn main() {
                 commands::guidance::audit(session.as_deref(), limit)
             }
             GuidanceAction::Verify { session } => commands::guidance::verify(session.as_deref()),
+        },
+        Commands::Intelligence { action } => match action {
+            IntelligenceAction::Generate {
+                force,
+                section,
+                dry_run,
+            } => commands::intelligence::generate(force, section.as_deref(), dry_run),
+            IntelligenceAction::Show { section, json } => {
+                commands::intelligence::show(section.as_deref(), json)
+            }
+            IntelligenceAction::Export { output } => {
+                commands::intelligence::export(output.as_deref())
+            }
+            IntelligenceAction::Status => commands::intelligence::status(),
         },
         Commands::Config { action } => match action {
             ConfigAction::Show => commands::config::show(),
@@ -799,6 +875,12 @@ fn main() {
             PluginAction::Enable { name } => commands::plugin::enable(&name),
             PluginAction::Disable { name } => commands::plugin::disable(&name),
         },
+        Commands::Index {
+            dry_run,
+            stats,
+            file,
+            prune,
+        } => commands::index::run(dry_run, stats, file.as_deref(), prune),
         Commands::TestHooks { event, verbose } => {
             commands::test_hooks::run(event.as_deref(), verbose)
         }

@@ -321,8 +321,8 @@ impl MemoryDb {
             return Ok(Vec::new());
         }
 
-        if all_vecs.len() > 50 {
-            // HNSW search
+        if all_vecs.len() > 200 {
+            // HNSW search (only worth the build cost for large sets)
             let mut index = crate::hnsw::HnswIndex::new();
             let points: Vec<(i64, Vec<f32>)> = all_vecs
                 .iter()

@@ -60,34 +60,69 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// Check if a line looks like data/stats rather than an actionable insight.
+fn is_data_line(s: &str) -> bool {
+    // Lines with lots of numbers, IDs, timestamps, or backtick-wrapped values are data
+    let digit_count = s.chars().filter(|c| c.is_ascii_digit()).count();
+    let backtick_count = s.chars().filter(|&c| c == '`').count();
+    let total = s.len();
+    if total == 0 {
+        return true;
+    }
+    // >30% digits = data line
+    if digit_count * 100 / total > 30 {
+        return true;
+    }
+    // Backtick-heavy lines are usually code/data references
+    if backtick_count >= 4 {
+        return true;
+    }
+    // Common data patterns
+    let lower = s.to_lowercase();
+    let data_indicators = [
+        "calls,", "ms total", "ms)", "count:", "total:", "score:",
+        "session id", "started at", "confidence:", "sim:", "(n=",
+        "occurrences", "fingerprint", "0x", "uuid", "hash",
+    ];
+    data_indicators.iter().any(|pat| lower.contains(pat))
+}
+
 fn extract_patterns(ctx: &super::HookContext, message: &str) {
     ctx.with_db("extract_patterns", |db| {
         let store = flowforge_memory::PatternStore::new(db, &ctx.config.patterns);
+        let mut stored = 0u32;
 
         for line in message.lines() {
             let trimmed = line.trim();
 
-            if trimmed.len() < 20 || trimmed.len() > 200 {
+            // Length gate: too short = not useful, too long = probably a paragraph
+            if trimmed.len() < 30 || trimmed.len() > 200 {
                 continue;
             }
 
-            if trimmed.starts_with("- ")
-                || trimmed.starts_with("* ")
-                || trimmed.starts_with("Note:")
-                || trimmed.starts_with("Pattern:")
-                || trimmed.starts_with("Learned:")
-            {
-                let content = trimmed
-                    .trim_start_matches("- ")
-                    .trim_start_matches("* ")
-                    .trim_start_matches("Note: ")
-                    .trim_start_matches("Pattern: ")
-                    .trim_start_matches("Learned: ");
+            // Only capture explicitly marked patterns/insights, not every bullet
+            let content = if trimmed.starts_with("Note:") || trimmed.starts_with("Note: ") {
+                trimmed.trim_start_matches("Note:").trim_start_matches("Note: ").trim()
+            } else if trimmed.starts_with("Pattern:") || trimmed.starts_with("Pattern: ") {
+                trimmed.trim_start_matches("Pattern:").trim_start_matches("Pattern: ").trim()
+            } else if trimmed.starts_with("Learned:") || trimmed.starts_with("Learned: ") {
+                trimmed.trim_start_matches("Learned:").trim_start_matches("Learned: ").trim()
+            } else {
+                // Skip generic bullets — they're almost always data/stats, not insights
+                continue;
+            };
 
-                if !content.is_empty() {
-                    store.store_short_term(content, "agent-output")?;
-                }
+            if content.is_empty() || is_data_line(content) {
+                continue;
             }
+
+            // Cap at 3 patterns per agent output to prevent flooding
+            if stored >= 3 {
+                break;
+            }
+
+            store.store_short_term(content, "agent-insight")?;
+            stored += 1;
         }
 
         Ok(())

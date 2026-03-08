@@ -45,14 +45,14 @@ const HOOK_TESTS: &[HookTest] = &[
         event: "UserPromptSubmit",
         cli_arg: "user-prompt-submit",
         must_have_stdout: true,
-        stdout_must_be_json: true,
+        stdout_must_be_json: false, // Context hooks output plain text, not JSON
         max_ms: 500,
     },
     HookTest {
         event: "SessionStart",
         cli_arg: "session-start",
         must_have_stdout: true,
-        stdout_must_be_json: true,
+        stdout_must_be_json: false, // Context hooks output plain text, not JSON
         max_ms: 500,
     },
     HookTest {
@@ -73,14 +73,14 @@ const HOOK_TESTS: &[HookTest] = &[
         event: "PreCompact",
         cli_arg: "pre-compact",
         must_have_stdout: true,
-        stdout_must_be_json: true,
+        stdout_must_be_json: false, // Context hooks output plain text, not JSON
         max_ms: 500,
     },
     HookTest {
         event: "SubagentStart",
         cli_arg: "subagent-start",
-        must_have_stdout: true,
-        stdout_must_be_json: true,
+        must_have_stdout: false, // Only emits context when agent_type matches a FlowForge agent def
+        stdout_must_be_json: false,
         max_ms: 500,
     },
     HookTest {

@@ -410,7 +410,124 @@ impl MemoryDb {
             results.push(row.sq()?);
         }
         Ok(results)
-    }}
+    }
+
+    /// Predict which files will likely need editing for a task, based on files edited
+    /// in past successful trajectories with similar task descriptions.
+    /// Returns (file_path, session_count) sorted by frequency.
+    pub fn predict_task_files(
+        &self,
+        keywords: &[String],
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>> {
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conditions: Vec<String> = keywords
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("LOWER(t.task_description) LIKE ?{}", i + 1))
+            .collect();
+        let where_clause = conditions.join(" OR ");
+
+        let sql = format!(
+            "SELECT e.file_path, COUNT(DISTINCT e.session_id) as session_count
+             FROM edits e
+             JOIN trajectories t ON t.session_id = e.session_id
+             WHERE t.task_description IS NOT NULL
+               AND t.verdict = 'success'
+               AND ({})
+             GROUP BY e.file_path
+             ORDER BY session_count DESC
+             LIMIT ?{}",
+            where_clause,
+            keywords.len() + 1
+        );
+
+        let mut stmt = self.conn.prepare(&sql).sq()?;
+        let like_params: Vec<String> = keywords.iter().map(|k| format!("%{}%", k)).collect();
+        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+        for p in &like_params {
+            params_vec.push(p as &dyn rusqlite::types::ToSql);
+        }
+        let limit_val = limit as i64;
+        params_vec.push(&limit_val);
+
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })
+            .sq()?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().sq()
+    }
+
+    /// Get the tool sequence from the best matching successful trajectory.
+    /// Returns the condensed sequence (e.g., ["Read", "Edit", "Bash"]) for strategy injection.
+    pub fn get_winning_sequence(
+        &self,
+        keywords: &[String],
+    ) -> Result<Option<Vec<String>>> {
+        if keywords.is_empty() {
+            return Ok(None);
+        }
+
+        let conditions: Vec<String> = keywords
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("LOWER(t.task_description) LIKE ?{}", i + 1))
+            .collect();
+        let where_clause = conditions.join(" OR ");
+
+        // Find the best successful trajectory (highest confidence) matching keywords
+        let sql = format!(
+            "SELECT t.id FROM trajectories t
+             WHERE t.task_description IS NOT NULL
+               AND t.verdict = 'success'
+               AND ({})
+             ORDER BY t.confidence DESC, t.ended_at DESC
+             LIMIT 1",
+            where_clause
+        );
+
+        let mut stmt = self.conn.prepare(&sql).sq()?;
+        let like_params: Vec<String> = keywords.iter().map(|k| format!("%{}%", k)).collect();
+        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+        for p in &like_params {
+            params_vec.push(p as &dyn rusqlite::types::ToSql);
+        }
+
+        let traj_id: Option<String> = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
+                row.get::<_, String>(0)
+            })
+            .sq()?
+            .next()
+            .and_then(|r| r.ok());
+
+        match traj_id {
+            Some(id) => {
+                let tools = self.trajectory_tool_sequence(&id)?;
+                if tools.is_empty() {
+                    return Ok(None);
+                }
+                // Condense consecutive duplicates
+                let mut condensed: Vec<String> = Vec::new();
+                for tool in &tools {
+                    if condensed.last().map_or(true, |last| last != tool) {
+                        condensed.push(tool.clone());
+                    }
+                }
+                // Deduplicate while preserving order (keep unique tools only)
+                let mut seen = std::collections::HashSet::new();
+                condensed.retain(|t| seen.insert(t.clone()));
+                condensed.truncate(10);
+                Ok(Some(condensed))
+            }
+            None => Ok(None),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -496,5 +613,128 @@ mod tests {
         let recent = db.get_recent_trajectory_tools(&tid, 10).unwrap();
         assert_eq!(recent.len(), 2);
         assert_eq!(recent, vec!["Read", "Edit"]);
+    }
+
+    #[test]
+    fn test_predict_task_files() {
+        let db = test_db();
+
+        // Create a session with a successful trajectory about "routing"
+        let session = flowforge_core::SessionInfo {
+            id: "sess-pred-1".to_string(),
+            started_at: Utc::now(),
+            ended_at: None,
+            cwd: "/tmp".to_string(),
+            edits: 0,
+            commands: 0,
+            summary: None,
+            transcript_path: None,
+        };
+        db.create_session(&session).unwrap();
+
+        let traj = Trajectory {
+            id: "traj-pred-1".to_string(),
+            session_id: "sess-pred-1".to_string(),
+            work_item_id: None,
+            agent_name: None,
+            task_description: Some("improve the routing system for agents".to_string()),
+            status: TrajectoryStatus::Completed,
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            verdict: Some(flowforge_core::trajectory::TrajectoryVerdict::Success),
+            confidence: Some(0.8),
+            metadata: None,
+            embedding_id: None,
+        };
+        db.create_trajectory(&traj).unwrap();
+
+        // Record edits in that session
+        let edit = flowforge_core::EditRecord {
+            session_id: "sess-pred-1".to_string(),
+            timestamp: Utc::now(),
+            file_path: "src/routing.rs".to_string(),
+            operation: "write".to_string(),
+            file_extension: Some("rs".to_string()),
+        };
+        db.record_edit(&edit).unwrap();
+        let edit2 = flowforge_core::EditRecord {
+            session_id: "sess-pred-1".to_string(),
+            timestamp: Utc::now(),
+            file_path: "src/agents.rs".to_string(),
+            operation: "write".to_string(),
+            file_extension: Some("rs".to_string()),
+        };
+        db.record_edit(&edit2).unwrap();
+
+        // Predict files for a "routing" task
+        let keywords = vec!["routing".to_string()];
+        let predicted = db.predict_task_files(&keywords, 5).unwrap();
+        assert!(!predicted.is_empty(), "should predict files from similar sessions");
+        let file_paths: Vec<&str> = predicted.iter().map(|(f, _)| f.as_str()).collect();
+        assert!(file_paths.contains(&"src/routing.rs"));
+        assert!(file_paths.contains(&"src/agents.rs"));
+    }
+
+    #[test]
+    fn test_predict_task_files_empty_keywords() {
+        let db = test_db();
+        let result = db.predict_task_files(&[], 5).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_winning_sequence() {
+        let db = test_db();
+
+        // Create session + trajectory
+        let session = flowforge_core::SessionInfo {
+            id: "sess-win-1".to_string(),
+            started_at: Utc::now(),
+            ended_at: None,
+            cwd: "/tmp".to_string(),
+            edits: 0,
+            commands: 0,
+            summary: None,
+            transcript_path: None,
+        };
+        db.create_session(&session).unwrap();
+
+        let traj = Trajectory {
+            id: "traj-win-1".to_string(),
+            session_id: "sess-win-1".to_string(),
+            work_item_id: None,
+            agent_name: None,
+            task_description: Some("fix the authentication module".to_string()),
+            status: TrajectoryStatus::Completed,
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            verdict: Some(flowforge_core::trajectory::TrajectoryVerdict::Success),
+            confidence: Some(0.9),
+            metadata: None,
+            embedding_id: None,
+        };
+        db.create_trajectory(&traj).unwrap();
+
+        // Record tool sequence: Read, Read, Edit, Bash, Edit, Bash
+        for tool in &["Read", "Read", "Edit", "Bash", "Edit", "Bash"] {
+            db.record_trajectory_step("traj-win-1", tool, None, StepOutcome::Success, None)
+                .unwrap();
+        }
+
+        // Get winning sequence for "authentication" task
+        let keywords = vec!["authentication".to_string()];
+        let seq = db.get_winning_sequence(&keywords).unwrap();
+        assert!(seq.is_some(), "should find a matching sequence");
+        let tools = seq.unwrap();
+        // Consecutive dupes removed, then deduped: Read, Edit, Bash
+        assert_eq!(tools, vec!["Read", "Edit", "Bash"]);
+    }
+
+    #[test]
+    fn test_get_winning_sequence_no_match() {
+        let db = test_db();
+        let keywords = vec!["nonexistent".to_string()];
+        let result = db.get_winning_sequence(&keywords).unwrap();
+        assert!(result.is_none());
     }
 }

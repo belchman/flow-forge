@@ -1537,8 +1537,8 @@ fn test_helpers_module_roundtrip() {
 }
 
 #[test]
-fn test_schema_version_is_8() {
-    assert_eq!(SCHEMA_VERSION, 8);
+fn test_schema_version_is_12() {
+    assert_eq!(SCHEMA_VERSION, 12);
 }
 
 #[test]

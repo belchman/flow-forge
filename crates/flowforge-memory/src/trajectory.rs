@@ -115,20 +115,133 @@ impl<'a> TrajectoryJudge<'a> {
             return Ok(None);
         }
 
-        let desc = trajectory
-            .task_description
-            .as_deref()
-            .unwrap_or("unknown task");
+        let desc = match trajectory.task_description.as_deref() {
+            Some(d) if Self::is_useful_description(d) => d,
+            _ => return Ok(None),
+        };
 
-        // Build pattern content: task description + tool sequence
-        let seq_str = tool_seq.join(" → ");
-        let pattern_content = format!("trajectory:{desc} | {seq_str}");
+        // Truncate long descriptions to first meaningful line, max 150 chars
+        let desc_clean = desc
+            .lines()
+            .next()
+            .unwrap_or(desc)
+            .chars()
+            .take(150)
+            .collect::<String>();
+
+        // Build pattern content: task description + condensed tool sequence.
+        // Deduplicate consecutive repeats and cap at 15 unique steps to keep patterns
+        // concise and useful (250-tool sequences waste context tokens).
+        let condensed: Vec<String> = {
+            let mut result = Vec::new();
+            let mut last: Option<&str> = None;
+            let mut repeat_count = 0u32;
+            for tool in &tool_seq {
+                if last == Some(tool.as_str()) {
+                    repeat_count += 1;
+                } else {
+                    if let Some(prev) = last {
+                        if repeat_count > 0 {
+                            result.push(format!("{}×{}", prev, repeat_count + 1));
+                        } else {
+                            result.push(prev.to_string());
+                        }
+                    }
+                    last = Some(tool);
+                    repeat_count = 0;
+                }
+            }
+            if let Some(prev) = last {
+                if repeat_count > 0 {
+                    result.push(format!("{}×{}", prev, repeat_count + 1));
+                } else {
+                    result.push(prev.to_string());
+                }
+            }
+            if result.len() > 15 {
+                let mut truncated: Vec<String> = result[..15].to_vec();
+                truncated.push(format!("…+{} more", result.len() - 15));
+                truncated
+            } else {
+                result
+            }
+        };
+        let seq_str = condensed.join(" → ");
+        let pattern_content = format!("trajectory:{desc_clean} | {seq_str}");
+
+        // Dedup: skip if a trajectory pattern with the same description already exists.
+        // Different tool sequences for the same task add noise, not value.
+        let desc_prefix = format!("trajectory:{}", desc_clean);
+        let existing: bool = self
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM patterns_short WHERE category = 'trajectory' AND content LIKE ?1",
+                rusqlite::params![format!("{}%", desc_prefix)],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if existing {
+            return Ok(None);
+        }
 
         // Store as long-lived pattern via PatternStore
         let store = PatternStore::new(self.db, self.config);
         store.store_short_term(&pattern_content, "trajectory")?;
 
         Ok(Some(pattern_content))
+    }
+
+    /// Check if a task description is high-enough quality to distill.
+    pub(crate) fn is_useful_description(desc: &str) -> bool {
+        let first_line = desc.lines().next().unwrap_or(desc).trim();
+
+        // Too short — not enough semantic content
+        let words: Vec<&str> = first_line.split_whitespace().collect();
+        if words.len() < 4 {
+            return false;
+        }
+
+        // Skip known trivial/vague prompts
+        let lower = first_line.to_lowercase();
+        let trivial = [
+            "hello", "hello world", "do it", "continue", "test", "test prompt",
+            "same shit", "set it up", "and fix", "fix it", "try again",
+            "still happening", "what do we have left", "unknown task",
+            "test if our fix works", "test prompt for routing",
+        ];
+        if trivial.iter().any(|t| lower == *t) {
+            return false;
+        }
+
+        // Skip pasted terminal output / error dumps (contains special chars)
+        if first_line.contains('⏺')
+            || first_line.contains('⎿')
+            || first_line.contains('│')
+            || first_line.contains('❯')
+        {
+            return false;
+        }
+
+        // Skip prompts that start with leading whitespace (pasted content)
+        if desc.starts_with(' ') || desc.starts_with('\t') {
+            return false;
+        }
+
+        // Skip prompts that are questions/meta (not actionable task descriptions)
+        let question_starts = [
+            "is there", "what do we", "do i get", "can you see",
+            "are we", "what is", "how do", "ok,", "ok ",
+            "we have restarted", "once completed", "test if",
+        ];
+        if question_starts
+            .iter()
+            .any(|q| lower.starts_with(q))
+        {
+            return false;
+        }
+
+        true
     }
 
     /// Consolidate trajectories: prune old failures, merge similar successes.
@@ -211,7 +324,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             work_item_id: None,
             agent_name: None,
-            task_description: Some("test task".to_string()),
+            task_description: Some("refactor the authentication module to use JWT".to_string()),
             status: TrajectoryStatus::Recording,
             started_at: Utc::now(),
             ended_at: None,
@@ -326,10 +439,44 @@ mod tests {
         let pattern = judge.distill("traj-1").unwrap();
         assert!(pattern.is_some());
         let content = pattern.unwrap();
-        assert!(content.contains("test task"));
+        assert!(content.contains("refactor the authentication"));
         assert!(content.contains("Read"));
         assert!(content.contains("Edit"));
         assert!(content.contains("Bash"));
+    }
+
+    #[test]
+    fn test_distill_skips_trivial_descriptions() {
+        // Verify quality filter rejects noise
+        assert!(!TrajectoryJudge::is_useful_description("hello"));
+        assert!(!TrajectoryJudge::is_useful_description("do it"));
+        assert!(!TrajectoryJudge::is_useful_description("continue"));
+        assert!(!TrajectoryJudge::is_useful_description("set it up")); // 3 words
+        assert!(!TrajectoryJudge::is_useful_description("⏺ Bash(cargo test)"));
+        assert!(!TrajectoryJudge::is_useful_description("❯ │ some output"));
+        assert!(!TrajectoryJudge::is_useful_description(
+            "❯ your main job is to work on this"
+        ));
+        assert!(!TrajectoryJudge::is_useful_description(
+            "is there anything we are missing that would be useful?"
+        ));
+        assert!(!TrajectoryJudge::is_useful_description(
+            "what do we have left to do?"
+        ));
+        assert!(!TrajectoryJudge::is_useful_description(
+            "ok, look at our statusline"
+        ));
+
+        // Verify quality filter accepts real tasks
+        assert!(TrajectoryJudge::is_useful_description(
+            "fix the login bug in auth.rs"
+        ));
+        assert!(TrajectoryJudge::is_useful_description(
+            "refactor the authentication module to use JWT"
+        ));
+        assert!(TrajectoryJudge::is_useful_description(
+            "We need better logging for agents"
+        ));
     }
 
     #[test]

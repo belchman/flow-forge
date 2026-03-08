@@ -162,6 +162,21 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Prompt intelligence generation if none exists but code index is populated
+    if let Some(ref db) = ctx.db {
+        let has_intel = db.has_intelligence().unwrap_or(false);
+        if !has_intel {
+            let code_count = db.count_code_entries().unwrap_or(0);
+            if code_count > 0 {
+                ready_msg.push_str(
+                    "\n[FlowForge] No project intelligence found. Run `flowforge intelligence generate` \
+                     to create project documentation, then use the `intelligence_refine` MCP tool to let \
+                     Claude improve sections marked with TODO."
+                );
+            }
+        }
+    }
+
     // Report active work items count at startup
     if let Some(active) = ctx.with_db("list_active_work_items", |db| {
         let filter = flowforge_core::WorkFilter {

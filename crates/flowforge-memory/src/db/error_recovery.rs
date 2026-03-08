@@ -211,14 +211,15 @@ impl MemoryDb {
         tool_name: &str,
         input_hash: &str,
         error_preview: Option<&str>,
+        fingerprint_id: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn
             .execute(
                 "INSERT INTO session_tool_failures
-                 (session_id, tool_name, input_hash, error_preview, timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![session_id, tool_name, input_hash, error_preview, now],
+                 (session_id, tool_name, input_hash, error_preview, timestamp, fingerprint_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![session_id, tool_name, input_hash, error_preview, now, fingerprint_id],
             )
             .sq()?;
         Ok(())
@@ -349,33 +350,46 @@ impl MemoryDb {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<(String, String)>> {
-        // Get unique (fingerprint_id, error_preview) from recent failures
+        // Get unique errors from recent failures, using stored fingerprint_id when available.
+        // Falls back to hash recomputation for legacy rows.
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT DISTINCT stf.error_preview, ef.id
-                 FROM session_tool_failures stf
-                 JOIN error_fingerprints ef ON ef.fingerprint = (
-                     SELECT fingerprint FROM error_fingerprints
-                     WHERE error_preview LIKE '%' || SUBSTR(stf.error_preview, 1, 50) || '%'
-                     LIMIT 1
-                 )
-                 WHERE stf.session_id = ?1
-                 ORDER BY stf.timestamp DESC
+                "SELECT DISTINCT error_preview, fingerprint_id
+                 FROM session_tool_failures
+                 WHERE session_id = ?1 AND error_preview IS NOT NULL
+                 ORDER BY timestamp DESC
                  LIMIT ?2",
             )
             .sq()?;
 
-        let results: Vec<(String, String)> = stmt
+        let rows: Vec<(String, Option<String>)> = stmt
             .query_map(params![session_id, limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, String>(1).unwrap_or_default(),
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })
             .sq()?
             .filter_map(|r| r.ok())
             .collect();
+
+        let mut results = Vec::new();
+        for (preview, stored_fp_id) in rows {
+            let fp_id = if let Some(id) = stored_fp_id {
+                Some(id)
+            } else {
+                let fp_hash = fingerprint_error(&preview);
+                self.conn
+                    .query_row(
+                        "SELECT id FROM error_fingerprints WHERE fingerprint = ?1",
+                        params![fp_hash],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .unwrap_or(None)
+            };
+            if let Some(id) = fp_id {
+                results.push((preview, id));
+            }
+        }
 
         Ok(results)
     }
@@ -567,28 +581,54 @@ impl MemoryDb {
             return Ok(0);
         }
 
-        // Get session failures with their fingerprint IDs
+        // Get session failures with their fingerprint IDs.
+        // Uses the fingerprint_id column stored at recording time (reliable).
+        // Falls back to hash recomputation for legacy rows without fingerprint_id.
         let failures: Vec<(String, String, String)> = {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT stf.tool_name, stf.error_preview, ef.id
-                     FROM session_tool_failures stf
-                     JOIN error_fingerprints ef ON ef.error_preview = stf.error_preview
-                     WHERE stf.session_id = ?1
-                     ORDER BY stf.timestamp ASC",
+                    "SELECT tool_name, error_preview, fingerprint_id
+                     FROM session_tool_failures
+                     WHERE session_id = ?1 AND error_preview IS NOT NULL
+                     ORDER BY timestamp ASC",
                 )
                 .sq()?;
 
-            let rows = stmt.query_map(params![session_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1).unwrap_or_default(),
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .sq()?;
-            rows.filter_map(|r| r.ok()).collect()
+            let rows: Vec<(String, String, Option<String>)> = stmt
+                .query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .sq()?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let mut result = Vec::new();
+            for (tool_name, error_preview, stored_fp_id) in rows {
+                let fp_id = if let Some(id) = stored_fp_id {
+                    // Direct lookup — reliable
+                    Some(id)
+                } else {
+                    // Legacy fallback: recompute hash (may not match for long errors)
+                    let fp_hash = fingerprint_error(&error_preview);
+                    self.conn
+                        .query_row(
+                            "SELECT id FROM error_fingerprints WHERE fingerprint = ?1",
+                            params![fp_hash],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .unwrap_or(None)
+                };
+                if let Some(id) = fp_id {
+                    result.push((tool_name, error_preview, id));
+                }
+            }
+            result
         };
 
         if failures.is_empty() {
@@ -628,24 +668,27 @@ impl MemoryDb {
                         .map(|s| s.tool_name.clone())
                         .collect();
 
-                    // Build a summary: "Fixed by: [Edit, Read, Edit] then re-ran Bash"
-                    let summary = if resolution_tools.is_empty() {
-                        format!("Re-ran {} successfully", fail_tool)
-                    } else {
-                        let unique_tools: Vec<String> = {
-                            let mut seen = std::collections::HashSet::new();
-                            resolution_tools
-                                .iter()
-                                .filter(|t| seen.insert(t.as_str()))
-                                .cloned()
-                                .collect()
-                        };
-                        format!(
-                            "Fixed via {} then re-ran {}",
-                            unique_tools.join(", "),
-                            fail_tool
-                        )
+                    // Skip transient retries (same tool immediately re-run with no
+                    // intermediate steps). These aren't real resolutions — just retries
+                    // that happened to succeed.
+                    if resolution_tools.is_empty() {
+                        continue;
+                    }
+
+                    // Build a summary with the fix path
+                    let unique_tools: Vec<String> = {
+                        let mut seen = std::collections::HashSet::new();
+                        resolution_tools
+                            .iter()
+                            .filter(|t| seen.insert(t.as_str()))
+                            .cloned()
+                            .collect()
                     };
+                    let summary = format!(
+                        "Fixed via {} then re-ran {}",
+                        unique_tools.join(", "),
+                        fail_tool
+                    );
 
                     self.record_error_resolution(
                         fingerprint_id,
@@ -662,6 +705,25 @@ impl MemoryDb {
         Ok(recorded)
     }
 
+    /// List all completed/judged trajectories that have failure steps.
+    /// Returns (trajectory_id, session_id) pairs for resolution backfilling.
+    pub fn list_trajectories_with_failures(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT t.id, t.session_id
+                 FROM trajectories t
+                 JOIN trajectory_steps ts ON ts.trajectory_id = t.id
+                 WHERE t.status IN ('completed', 'judged')
+                 AND ts.outcome = 'failure'",
+            )
+            .sq()?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .sq()?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().sq()
+    }
+
     /// Count distinct tool failures in a session (for statusline display).
     pub fn count_session_failures(&self, session_id: &str) -> Result<u64> {
         let count: i64 = self
@@ -673,6 +735,60 @@ impl MemoryDb {
             )
             .sq()?;
         Ok(count as u64)
+    }
+
+    /// Find error warnings for a set of predicted files.
+    /// Looks for errors that occurred in sessions where these files were edited.
+    /// Returns (error_preview, tool_name, resolution_summary_if_any).
+    pub fn get_errors_for_files(
+        &self,
+        file_paths: &[&str],
+        limit: usize,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        if file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: Vec<String> = (1..=file_paths.len())
+            .map(|i| format!("?{}", i))
+            .collect();
+        let in_clause = placeholders.join(", ");
+
+        let sql = format!(
+            "SELECT DISTINCT ef.error_preview, ef.tool_name,
+                    (SELECT er.resolution_summary FROM error_resolutions er
+                     WHERE er.fingerprint_id = ef.id AND er.success_count > 0
+                     ORDER BY er.success_count DESC LIMIT 1) as best_resolution
+             FROM error_fingerprints ef
+             JOIN session_tool_failures stf ON stf.fingerprint_id = ef.id
+             JOIN edits e ON e.session_id = stf.session_id
+             WHERE e.file_path IN ({})
+               AND ef.occurrence_count >= 2
+             GROUP BY ef.fingerprint
+             ORDER BY ef.occurrence_count DESC
+             LIMIT ?{}",
+            in_clause,
+            file_paths.len() + 1
+        );
+
+        let mut stmt = self.conn.prepare(&sql).sq()?;
+        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+        for p in file_paths {
+            params_vec.push(p as &dyn rusqlite::types::ToSql);
+        }
+        let limit_val = limit as i64;
+        params_vec.push(&limit_val);
+
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .sq()?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().sq()
     }
 }
 
@@ -810,9 +926,9 @@ mod tests {
         let db = test_db();
         test_session(&db, "sess-fail-1");
 
-        db.record_tool_failure("sess-fail-1", "Bash", "abc123", Some("error"))
+        db.record_tool_failure("sess-fail-1", "Bash", "abc123", Some("error"), None)
             .unwrap();
-        db.record_tool_failure("sess-fail-1", "Bash", "abc123", Some("error"))
+        db.record_tool_failure("sess-fail-1", "Bash", "abc123", Some("error"), None)
             .unwrap();
 
         let count = db
@@ -836,9 +952,9 @@ mod tests {
         test_session(&db, "sess-a");
         test_session(&db, "sess-b");
 
-        db.record_tool_failure("sess-a", "Bash", "hash1", Some("err"))
+        db.record_tool_failure("sess-a", "Bash", "hash1", Some("err"), None)
             .unwrap();
-        db.record_tool_failure("sess-b", "Bash", "hash1", Some("err"))
+        db.record_tool_failure("sess-b", "Bash", "hash1", Some("err"), None)
             .unwrap();
 
         assert_eq!(
@@ -1173,6 +1289,7 @@ mod tests {
             "Bash",
             "hash1",
             Some("error[E0425]: cannot find value"),
+            Some(&fp_id),
         )
         .unwrap();
 
@@ -1257,7 +1374,7 @@ mod tests {
         };
         db.create_trajectory(&traj).unwrap();
 
-        // Bash fails then immediately succeeds (simple retry)
+        // Bash fails then immediately succeeds (simple retry — no intermediate tools)
         db.record_trajectory_step("traj-auto-4", "Bash", None, StepOutcome::Failure, None)
             .unwrap();
         db.record_trajectory_step("traj-auto-4", "Bash", None, StepOutcome::Success, None)
@@ -1271,20 +1388,19 @@ mod tests {
             "Bash",
             "hash2",
             Some("connection timed out"),
+            Some(&fp_id),
         )
         .unwrap();
 
+        // Transient retries (no intermediate steps) are now skipped —
+        // they aren't real resolutions, just retries that happened to succeed.
         let count = db
             .auto_detect_resolutions("sess-auto-4", "traj-auto-4")
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 0);
 
         let resolutions = db.get_resolutions_for_fingerprint(&fp_id, 5).unwrap();
-        assert_eq!(resolutions.len(), 1);
-        assert!(resolutions[0]
-            .resolution_summary
-            .contains("Re-ran Bash successfully"));
-        assert!(resolutions[0].tool_sequence.is_empty());
+        assert!(resolutions.is_empty());
     }
 
     #[test]
@@ -1302,19 +1418,19 @@ mod tests {
         assert_eq!(db.get_tool_failure_count("sess-esc", tool, hash).unwrap(), 0);
 
         // Record 1st failure → count=1 (below ASK threshold of 2)
-        db.record_tool_failure("sess-esc", tool, hash, preview).unwrap();
+        db.record_tool_failure("sess-esc", tool, hash, preview, None).unwrap();
         assert_eq!(db.get_tool_failure_count("sess-esc", tool, hash).unwrap(), 1);
 
         // Record 2nd failure → count=2 (ASK threshold)
-        db.record_tool_failure("sess-esc", tool, hash, preview).unwrap();
+        db.record_tool_failure("sess-esc", tool, hash, preview, None).unwrap();
         assert_eq!(db.get_tool_failure_count("sess-esc", tool, hash).unwrap(), 2);
 
         // Record 3rd failure → count=3 (default DENY threshold)
-        db.record_tool_failure("sess-esc", tool, hash, preview).unwrap();
+        db.record_tool_failure("sess-esc", tool, hash, preview, None).unwrap();
         assert_eq!(db.get_tool_failure_count("sess-esc", tool, hash).unwrap(), 3);
 
         // Different input hash → separate count (isolation proof)
-        db.record_tool_failure("sess-esc", tool, "different-hash", preview).unwrap();
+        db.record_tool_failure("sess-esc", tool, "different-hash", preview, None).unwrap();
         assert_eq!(db.get_tool_failure_count("sess-esc", tool, "different-hash").unwrap(), 1);
         // Original still at 3
         assert_eq!(db.get_tool_failure_count("sess-esc", tool, hash).unwrap(), 3);
@@ -1338,7 +1454,7 @@ mod tests {
 
         // Record via both paths
         let fp_id = db.record_error_occurrence("Bash", &long_error).unwrap();
-        db.record_tool_failure("sess-trunc", "Bash", "hash-trunc", Some(&truncated)).unwrap();
+        db.record_tool_failure("sess-trunc", "Bash", "hash-trunc", Some(&truncated), Some(&fp_id)).unwrap();
 
         // The JOIN must match — this is the core bug fix proof
         let matching: i64 = db.conn.query_row(
@@ -1377,6 +1493,8 @@ mod tests {
         };
         db.create_trajectory(&traj).unwrap();
         db.record_trajectory_step("traj-mb", "Bash", None, StepOutcome::Failure, None).unwrap();
+        db.record_trajectory_step("traj-mb", "Read", None, StepOutcome::Success, None).unwrap();
+        db.record_trajectory_step("traj-mb", "Edit", None, StepOutcome::Success, None).unwrap();
         db.record_trajectory_step("traj-mb", "Bash", None, StepOutcome::Success, None).unwrap();
 
         // Use an error with multi-byte chars
@@ -1385,12 +1503,46 @@ mod tests {
 
         // Truncate the same way post_tool_use_failure.rs does
         let preview: String = error_text.chars().take(200).collect();
-        db.record_tool_failure("sess-mb", "Bash", "hash-mb", Some(&preview)).unwrap();
+        db.record_tool_failure("sess-mb", "Bash", "hash-mb", Some(&preview), Some(&fp_id)).unwrap();
 
         let count = db.auto_detect_resolutions("sess-mb", "traj-mb").unwrap();
         assert_eq!(count, 1, "auto_detect_resolutions must find resolution with multibyte errors");
 
         let resolutions = db.get_resolutions_for_fingerprint(&fp_id, 5).unwrap();
         assert_eq!(resolutions.len(), 1);
+    }
+
+    #[test]
+    fn test_get_errors_for_files_empty_input() {
+        let db = test_db();
+        let result = db.get_errors_for_files(&[], 5).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_errors_for_files_finds_related_errors() {
+        let db = test_db();
+        test_session(&db, "sess-ef-1");
+
+        // Record an error with occurrence_count >= 2
+        let fp_id = db.record_error_occurrence("Bash", "compilation error: cannot find crate").unwrap();
+        db.record_error_occurrence("Bash", "compilation error: cannot find crate").unwrap();
+
+        // Record tool failure in the session with fingerprint_id
+        db.record_tool_failure("sess-ef-1", "Bash", "hash-ef", Some("compilation error"), Some(&fp_id)).unwrap();
+
+        // Record an edit in the same session
+        db.record_edit(&flowforge_core::EditRecord {
+            session_id: "sess-ef-1".to_string(),
+            timestamp: Utc::now(),
+            file_path: "src/main.rs".to_string(),
+            operation: "write".to_string(),
+            file_extension: Some("rs".to_string()),
+        }).unwrap();
+
+        // Query errors for the file
+        let errors = db.get_errors_for_files(&["src/main.rs"], 5).unwrap();
+        assert!(!errors.is_empty(), "should find errors from sessions where the file was edited");
+        assert!(errors[0].0.contains("compilation error"));
     }
 }

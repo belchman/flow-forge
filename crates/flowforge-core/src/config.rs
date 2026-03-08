@@ -54,6 +54,10 @@ pub struct VectorsConfig {
     pub embed_errors: bool,
     /// Embed work items on creation. Default: true.
     pub embed_work_items: bool,
+    /// Embed code index entries during `flowforge index`. Default: true.
+    pub embed_code: bool,
+    /// Embed project intelligence sections. Default: true.
+    pub embed_intelligence: bool,
     /// Maximum conversation messages to embed per session. Default: 50.
     pub conversation_max_per_session: usize,
     /// Minimum message length (chars) to embed. Default: 50.
@@ -67,6 +71,8 @@ impl Default for VectorsConfig {
             embed_trajectories: true,
             embed_errors: true,
             embed_work_items: true,
+            embed_code: true,
+            embed_intelligence: true,
             conversation_max_per_session: 50,
             conversation_min_length: 50,
         }
@@ -320,6 +326,9 @@ pub struct HooksConfig {
     /// Maximum total characters for all context injections on each UserPromptSubmit.
     /// Roughly 4 chars per token, so 3000 chars ≈ 750 tokens. Default: 3000.
     pub context_budget_chars: usize,
+    /// Enable project intelligence injection into context. Default: true.
+    #[serde(default = "default_true")]
+    pub intelligence: bool,
 }
 
 impl Default for HooksConfig {
@@ -331,6 +340,7 @@ impl Default for HooksConfig {
             learning: true,
             inject_agent_body: false,
             context_budget_chars: 3000,
+            intelligence: true,
         }
     }
 }
@@ -534,6 +544,10 @@ pub struct PluginsConfig {
     /// Plugins to explicitly disable (by name). Overrides `enabled`. Default: [].
     #[serde(default)]
     pub disabled: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl FlowForgeConfig {

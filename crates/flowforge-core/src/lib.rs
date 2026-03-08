@@ -1,4 +1,7 @@
+pub mod code_symbols;
 pub mod config;
+pub mod intelligence;
+pub mod project_detection;
 pub mod error;
 pub mod guidance;
 pub mod hook;

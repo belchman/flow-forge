@@ -7,16 +7,9 @@ pub fn run() -> Result<()> {
     let ctx = super::HookContext::init()?;
     let input = PostToolUseFailureInput::from_value(&ctx.raw)?;
 
-    // Record failed tool use for error pattern tracking
-    if ctx.config.hooks.learning {
-        ctx.with_db("store_error_pattern", |db| {
-            let error_msg = input.error.as_deref().unwrap_or("unknown error");
-            let truncated: String = error_msg.chars().take(100).collect();
-            let pattern = format!("tool_failure:{} - {}", input.tool_name, truncated);
-            let store = flowforge_memory::PatternStore::new(db, &ctx.config.patterns);
-            store.store_short_term(&pattern, "error_pattern")
-        });
-    }
+    // Error tracking is handled by the error fingerprinting + resolution system below.
+    // Raw error messages as patterns were noise — they lack resolutions and duplicate
+    // what error_fingerprints/error_resolutions already track.
 
     // Record trajectory failure step + error fingerprint + failure loop tracking
     let error_msg = input.error.clone();
@@ -24,9 +17,19 @@ pub fn run() -> Result<()> {
     let input_json = serde_json::to_string(&input.tool_input).unwrap_or_default();
     let input_hash = format!("{:x}", Sha256::digest(input_json.as_bytes()));
 
+    // Use session_id from hook input as fallback when get_current_session() returns None.
+    // This ensures session_tool_failures are always recorded, which is critical for
+    // auto_detect_resolutions to find and create error resolutions.
+    let hook_session_id = input.common.session_id.clone();
+
     ctx.with_db("record_trajectory_failure_step", |db| {
-        if let Some(session) = db.get_current_session()? {
-            if let Some(trajectory) = db.get_active_trajectory(&session.id)? {
+        let session_id = db
+            .get_current_session()?
+            .map(|s| s.id)
+            .or(hook_session_id);
+
+        if let Some(ref sid) = session_id {
+            if let Some(trajectory) = db.get_active_trajectory(sid)? {
                 db.record_trajectory_step(
                     &trajectory.id,
                     &tool_name,
@@ -37,6 +40,7 @@ pub fn run() -> Result<()> {
             }
 
             // Record error fingerprint for resolution tracking
+            let mut fp_id: Option<String> = None;
             if let Some(ref err) = error_msg {
                 let fingerprint_id = db.record_error_occurrence(&tool_name, err)?;
 
@@ -54,17 +58,18 @@ pub fn run() -> Result<()> {
                         db.store_vector("error", &fingerprint_id, &vec)?;
                     }
                 }
+                fp_id = Some(fingerprint_id);
             }
 
             // Record tool failure for loop detection in pre_tool_use
             let err_preview: Option<String> = error_msg.as_ref().map(|e| {
                 e.chars().take(200).collect()
             });
-            db.record_tool_failure(&session.id, &tool_name, &input_hash, err_preview.as_deref())?;
+            db.record_tool_failure(sid, &tool_name, &input_hash, err_preview.as_deref(), fp_id.as_deref())?;
 
             // ACTIVE LEARNING: Feed tool failure back to routing weights immediately.
             // Every failed tool call after a routing suggestion weakens that route.
-            let key = format!("active_routing:{}", session.id);
+            let key = format!("active_routing:{}", sid);
             if let Some(routing_info) = db.get_meta(&key)? {
                 if let Some((agent_name, task_pattern)) = routing_info.split_once('|') {
                     let _ = db.record_routing_failure(task_pattern, agent_name);

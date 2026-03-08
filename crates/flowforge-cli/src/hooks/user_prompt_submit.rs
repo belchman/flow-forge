@@ -1,7 +1,7 @@
 use flowforge_agents::{AgentRegistry, AgentRouter};
 use flowforge_core::hook::{ContextOutput, UserPromptSubmitInput};
-use flowforge_core::{PatternTier, Result, RoutingContext};
-use flowforge_memory::{MemoryDb, PatternStore};
+use flowforge_core::{Result, RoutingContext};
+use flowforge_memory::MemoryDb;
 use std::collections::HashMap;
 
 pub fn run() -> Result<()> {
@@ -51,6 +51,12 @@ pub fn run() -> Result<()> {
             .get_or_init(|| flowforge_memory::default_embedder(&ctx.config.patterns))
     };
 
+    // Pre-compute prompt embedding ONCE and reuse everywhere (saves 5-6 redundant embed calls).
+    let prompt_vec_cell: std::cell::OnceCell<Vec<f32>> = std::cell::OnceCell::new();
+    let get_prompt_vec = || -> &[f32] {
+        prompt_vec_cell.get_or_init(|| get_embedder().embed(&prompt))
+    };
+
     // Resolve session_id and trajectory_id once for injection recording
     let (current_session_id, current_trajectory_id) = if let Some(db) = db {
         let sid = db
@@ -71,62 +77,69 @@ pub fn run() -> Result<()> {
 
     // Set trajectory task description from first user prompt.
     // If this is the first prompt (no task_description yet), also inject session continuity.
+    // Reuse the trajectory we already fetched above (avoid redundant DB call).
     if let Some(db) = db {
         if let (Some(ref sid), Some(ref tid)) = (&current_session_id, &current_trajectory_id) {
-            if let Ok(Some(trajectory)) = db.get_active_trajectory(sid) {
-                if trajectory.task_description.is_none() {
-                    let desc: String = prompt.chars().take(200).collect();
-                    let _ = db.set_trajectory_task_description(tid, &desc);
+            // Check task_description directly — we already confirmed trajectory exists above
+            let needs_description = db
+                .get_active_trajectory(sid)
+                .ok()
+                .flatten()
+                .map(|t| t.task_description.is_none())
+                .unwrap_or(false);
+            if needs_description {
+                let desc: String = prompt.chars().take(200).collect();
+                let _ = db.set_trajectory_task_description(tid, &desc);
 
-                    // First prompt: inject session continuity context
-                    let cwd = input
-                        .common
-                        .cwd
-                        .as_deref()
-                        .unwrap_or(".");
-                    if let Ok(Some(prev)) = db.get_previous_session_context(cwd) {
-                        let mut prev_ctx = String::from(
-                            "[FlowForge Session Continuity] Your last session in this project:",
+                // First prompt: inject session continuity context
+                let cwd = input
+                    .common
+                    .cwd
+                    .as_deref()
+                    .unwrap_or(".");
+                if let Ok(Some(prev)) = db.get_previous_session_context(cwd) {
+                    let mut prev_ctx = String::from(
+                        "[FlowForge Session Continuity] Your last session in this project:",
+                    );
+                    if let Some(ref task) = prev.task_description {
+                        prev_ctx.push_str(&format!("\n  Task: {}", task));
+                    }
+                    if let Some(ref verdict) = prev.verdict {
+                        prev_ctx.push_str(&format!(" (outcome: {})", verdict));
+                    }
+                    if !prev.files_modified.is_empty() {
+                        let files: Vec<&str> = prev
+                            .files_modified
+                            .iter()
+                            .take(5)
+                            .map(|s| s.as_str())
+                            .collect();
+                        prev_ctx.push_str(&format!("\n  Files modified: {}", files.join(", ")));
+                    }
+                    context_parts.push(prev_ctx);
+
+                    if let Some(ref session_id) = current_session_id {
+                        let _ = db.record_context_injection(
+                            session_id,
+                            current_trajectory_id.as_deref(),
+                            "session_continuity",
+                            Some(&prev.session_id),
+                            None,
+                            None,
                         );
-                        if let Some(ref task) = prev.task_description {
-                            prev_ctx.push_str(&format!("\n  Task: {}", task));
-                        }
-                        if let Some(ref verdict) = prev.verdict {
-                            prev_ctx.push_str(&format!(" (outcome: {})", verdict));
-                        }
-                        if !prev.files_modified.is_empty() {
-                            let files: Vec<&str> = prev
-                                .files_modified
-                                .iter()
-                                .take(5)
-                                .map(|s| s.as_str())
-                                .collect();
-                            prev_ctx.push_str(&format!("\n  Files modified: {}", files.join(", ")));
-                        }
-                        context_parts.push(prev_ctx);
-
-                        if let Some(ref session_id) = current_session_id {
-                            let _ = db.record_context_injection(
-                                session_id,
-                                current_trajectory_id.as_deref(),
-                                "session_continuity",
-                                Some(&prev.session_id),
-                                None,
-                                None,
-                            );
-                        }
                     }
                 }
             }
         }
     }
 
+
     // Load learned weights once from the shared DB connection (A10)
     // Also pre-compute similarity-based matches for generalization (Fix 5)
     // Skip on trivial prompts — no point routing "ok" or "yes"
     let learned_weights = if !is_trivial {
         if let Some(db) = db {
-            load_learned_weights_from_db(db, &prompt, get_embedder())
+            load_learned_weights_from_db(db, &prompt, get_prompt_vec())
         } else {
             HashMap::new()
         }
@@ -140,7 +153,6 @@ pub fn run() -> Result<()> {
     } else {
         None
     };
-
     // Route the task to suggested agents (skip for trivial prompts)
     if ctx.config.hooks.routing && !is_trivial {
         if let Ok(registry) = AgentRegistry::load(&ctx.config.agents) {
@@ -153,13 +165,12 @@ pub fn run() -> Result<()> {
             let router = AgentRouter::new(&routing_config);
             let agents: Vec<&_> = registry.list().into_iter().collect();
 
-            // Compute semantic scores for all agents
+            // Compute semantic scores for all agents (reuse pre-computed prompt vector)
             let semantic_scores = if let Some(db) = db {
-                compute_semantic_scores(db, &prompt, &agents, get_embedder())
+                compute_semantic_scores(db, get_prompt_vec(), &agents, get_embedder())
             } else {
                 None
             };
-
             let results = router.route(
                 &prompt,
                 &agents,
@@ -312,6 +323,7 @@ pub fn run() -> Result<()> {
         }
     }
 
+
     // Inject active work items context (C4)
     if let Some(db) = db {
         let filter = flowforge_core::WorkFilter {
@@ -355,8 +367,8 @@ pub fn run() -> Result<()> {
     // Inject related past work items from semantic search
     if let Some(db) = db {
         if ctx.config.vectors.embed_work_items && !is_trivial {
-            let query_vec = get_embedder().embed(&prompt);
-            if let Ok(results) = db.search_vectors(&query_vec, &["work_item"], 3) {
+            let query_vec = get_prompt_vec();
+            if let Ok(results) = db.search_vectors(query_vec, &["work_item"], 3) {
                 let completed_filter = flowforge_core::WorkFilter {
                     status: Some(flowforge_core::WorkStatus::Completed),
                     ..Default::default()
@@ -383,6 +395,127 @@ pub fn run() -> Result<()> {
                         }
                     }
                     context_parts.push(work_ctx);
+                }
+            }
+        }
+    }
+
+    // Codebase file suggestions: search code_index vectors + symbol keywords
+    // against the prompt. Inject relevant file paths with descriptions.
+    if !is_trivial && ctx.config.vectors.embed_code {
+        if let Some(db) = db {
+            let mut suggested_files: Vec<(String, String, Vec<String>)> = Vec::new(); // (path, desc, symbols)
+            let mut seen_paths = std::collections::HashSet::new();
+
+            // 1. Semantic search against code_index vectors
+            let query_vec = get_prompt_vec();
+            if let Ok(results) = db.search_vectors(query_vec, &["code_file"], 5) {
+                for r in results.iter().filter(|r| r.similarity > 0.35) {
+                    if seen_paths.insert(r.source_id.clone()) {
+                        if let Ok(Some(entry)) = db.get_code_entry(&r.source_id) {
+                            let top_syms: Vec<String> =
+                                entry.symbols.iter().take(4).cloned().collect();
+                            suggested_files.push((
+                                entry.file_path.clone(),
+                                entry.description.clone(),
+                                top_syms,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // 2. Keyword LIKE search on symbols for prompt words >= 4 chars
+            let keywords: Vec<&str> = prompt
+                .split_whitespace()
+                .filter(|w| w.len() >= 4)
+                .take(5)
+                .collect();
+            for kw in &keywords {
+                if let Ok(entries) = db.search_code_symbols(kw, 3) {
+                    for entry in entries {
+                        if seen_paths.insert(entry.file_path.clone()) {
+                            let top_syms: Vec<String> =
+                                entry.symbols.iter().take(4).cloned().collect();
+                            suggested_files.push((
+                                entry.file_path.clone(),
+                                entry.description.clone(),
+                                top_syms,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            suggested_files.truncate(5);
+
+            if !suggested_files.is_empty() {
+                let mut code_ctx = String::from("[FlowForge Codebase] Relevant files:");
+                for (path, desc, syms) in &suggested_files {
+                    let short_desc = if desc.is_empty() {
+                        String::new()
+                    } else {
+                        let d: String = desc.chars().take(60).collect();
+                        format!(" — {d}")
+                    };
+                    let sym_str = if syms.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", syms.join(", "))
+                    };
+                    code_ctx.push_str(&format!("\n  {path}{short_desc}{sym_str}"));
+                }
+                context_parts.push(code_ctx);
+
+                if let Some(ref sid) = current_session_id {
+                    let _ = db.record_context_injection(
+                        sid,
+                        current_trajectory_id.as_deref(),
+                        "codebase_suggestion",
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    // Project intelligence injection: search project_intel vectors against prompt
+    if !is_trivial && ctx.config.hooks.intelligence {
+        if let Some(db) = db {
+            if db.has_intelligence().unwrap_or(false) {
+                let query_vec = get_prompt_vec();
+                if let Ok(results) = db.search_vectors(query_vec, &["project_intel"], 4) {
+                    let relevant: Vec<_> = results
+                        .iter()
+                        .filter(|r| r.similarity > 0.40)
+                        .take(2)
+                        .collect();
+
+                    for r in &relevant {
+                        if let Ok(Some(section)) =
+                            db.get_intelligence_section(&r.source_id)
+                        {
+                            let truncated: String =
+                                section.content.chars().take(500).collect();
+                            context_parts.push(format!(
+                                "[FlowForge Intel: {}] {}",
+                                section.section_title, truncated
+                            ));
+
+                            if let Some(ref sid) = current_session_id {
+                                let _ = db.record_context_injection(
+                                    sid,
+                                    current_trajectory_id.as_deref(),
+                                    "project_intel",
+                                    Some(&r.source_id),
+                                    Some(r.similarity as f64),
+                                    None,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -425,73 +558,50 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // Search FlowForge memory using semantic vector search + cluster boosting
+
+    // Search FlowForge memory — use top patterns by confidence/usage instead of
+    // expensive HNSW rebuild (which loads 500+ vectors from SQLite on every prompt).
     if ctx.config.hooks.learning {
         if let Some(db) = db {
-            let store = PatternStore::new(db, &ctx.config.patterns);
-            if let Ok(matches) = store.search_all_patterns(&prompt, 5) {
-                // Filter out low-similarity noise (use self-tuned threshold if available)
-                let sim_floor = db
-                    .get_meta("tuned_min_injection_similarity")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(ctx.config.patterns.min_injection_similarity);
-                let matches: Vec<_> = matches
-                    .into_iter()
-                    .filter(|m| m.similarity as f64 >= sim_floor)
-                    .collect();
-
-                let proven: Vec<_> = matches
+            // Search patterns relevant to the current prompt via keyword matching.
+            // Falls back to top-by-confidence if no keywords match.
+            if let Ok(top_patterns) = db.search_patterns_by_keywords(&prompt, 5) {
+                let proven: Vec<_> = top_patterns
                     .iter()
-                    .filter(|m| m.tier == PatternTier::Long && m.confidence > 0.5)
-                    .collect();
-                let recent: Vec<_> = matches
-                    .iter()
-                    .filter(|m| m.tier == PatternTier::Short && m.confidence > 0.4)
+                    .filter(|p| {
+                        p.confidence >= 0.5
+                            && p.category != "agent-output"
+                            && p.category != "error_pattern" // Handled by error recovery system
+                    })
                     .collect();
 
                 if !proven.is_empty() {
-                    let mut pattern_ctx = String::from("[FlowForge Memory] Proven patterns:");
+                    let mut pattern_ctx = String::from("[FlowForge Memory] Relevant patterns:");
                     for p in &proven {
                         pattern_ctx.push_str(&format!(
-                            "\n- {} (conf: {:.0}%, sim: {:.0}%, used: {}x)",
+                            "\n- {} (conf: {:.0}%)",
                             p.content,
-                            p.confidence * 100.0,
-                            p.similarity * 100.0,
-                            p.usage_count
+                            p.confidence * 100.0
                         ));
+                        // Record usage so patterns can be promoted to long-term.
+                        // Without this, all patterns stay at usage_count=0 and never
+                        // meet the promotion criteria (usage >= 1 AND confidence >= 0.5).
+                        let _ = db.update_pattern_short_usage(&p.id);
                     }
                     context_parts.push(pattern_ctx);
-                }
 
-                if !recent.is_empty() {
-                    let mut pattern_ctx = String::from("[FlowForge Memory] Relevant patterns:");
-                    for p in &recent {
-                        pattern_ctx.push_str(&format!(
-                            "\n- {} (conf: {:.0}%, sim: {:.0}%)",
-                            p.content,
-                            p.confidence * 100.0,
-                            p.similarity * 100.0
-                        ));
-                    }
-                    context_parts.push(pattern_ctx);
-                }
-
-                // Record usage and injection on all injected patterns
-                for m in proven.iter().chain(recent.iter()) {
-                    let _ = store.record_usage(&m.id);
-
-                    // Record pattern injection for impact tracking
+                    // Record injection for impact tracking
                     if let Some(ref sid) = current_session_id {
-                        let _ = db.record_context_injection(
-                            sid,
-                            current_trajectory_id.as_deref(),
-                            "pattern",
-                            Some(&m.id),
-                            Some(m.similarity as f64),
-                            None,
-                        );
+                        for p in &proven {
+                            let _ = db.record_context_injection(
+                                sid,
+                                current_trajectory_id.as_deref(),
+                                "pattern",
+                                Some(&p.id),
+                                None,
+                                None,
+                            );
+                        }
                     }
                 }
             }
@@ -523,28 +633,12 @@ pub fn run() -> Result<()> {
                 }
             }
 
-            // Inject similar trajectory insights (skip for trivial prompts)
-            if ctx.config.vectors.embed_trajectories && !is_trivial {
-                let query_vec = get_embedder().embed(&prompt);
-                if let Ok(insights) = db.find_similar_trajectories_semantic(&query_vec, 2) {
-                    if !insights.is_empty() {
-                        let mut traj_ctx = String::from("[FlowForge Memory] Similar past approaches:");
-                        for insight in &insights {
-                            let verdict_str = insight.verdict.as_deref().unwrap_or("unknown");
-                            traj_ctx.push_str(&format!(
-                                "\n- {} (verdict: {}, {} steps, {:.0}% success)",
-                                insight.task_description.chars().take(80).collect::<String>(),
-                                verdict_str,
-                                insight.total_steps,
-                                insight.success_rate * 100.0,
-                            ));
-                        }
-                        context_parts.push(traj_ctx);
-                    }
-                }
-            }
+            // Trajectory insights are now captured as distilled trajectory patterns in
+            // patterns_short (category "trajectory"). The keyword-matched pattern injection
+            // above already handles this — no need to also scan raw trajectories.
         }
     }
+
 
     // File dependency injection: find commonly co-edited files for recently touched files
     if ctx.config.hooks.learning {
@@ -648,8 +742,12 @@ pub fn run() -> Result<()> {
                             }
                         }
                     }
-                    // Semantic fallback: if no exact resolutions found, search by similarity
-                    if resolution_hints.is_empty() && ctx.config.vectors.embed_errors {
+                    // Semantic fallback: if no exact resolutions found, search by similarity.
+                    // Skip entirely if 0 resolutions exist in the DB — saves expensive vector search.
+                    let has_any_resolutions = resolution_hints.is_empty()
+                        && ctx.config.vectors.embed_errors
+                        && db.get_error_stats().map(|(_, r, _)| r > 0).unwrap_or(false);
+                    if has_any_resolutions {
                         for (error_preview, _) in &recent_errors {
                             let query_vec = get_embedder().embed(error_preview);
                             if let Ok(semantic_results) =
@@ -700,6 +798,66 @@ pub fn run() -> Result<()> {
         }
     }
 
+
+    // File-aware convention injection: inject relevant conventions based on recently
+    // edited files, not just prompt keywords. E.g., editing schema.rs → schema convention.
+    if ctx.config.hooks.learning {
+        if let Some(db) = db {
+            if let Some(ref sid) = current_session_id {
+                if let Ok(edits) = db.get_edits_for_session(sid) {
+                    // Build a search string from recently edited file names
+                    let mut seen = std::collections::HashSet::new();
+                    let file_keywords: String = edits
+                        .iter()
+                        .rev()
+                        .filter(|e| seen.insert(e.file_path.as_str()))
+                        .take(3)
+                        .filter_map(|e| {
+                            std::path::Path::new(&e.file_path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    if !file_keywords.is_empty() {
+                        // Search for patterns matching file names (e.g., "schema" matches schema convention)
+                        if let Ok(file_patterns) =
+                            db.search_patterns_by_keywords(&file_keywords, 3)
+                        {
+                            let new_conventions: Vec<_> = file_patterns
+                                .iter()
+                                .filter(|p| {
+                                    p.category == "code_style"
+                                        && p.confidence >= 0.5
+                                        // Don't duplicate patterns already injected by keyword match
+                                        && !context_parts
+                                            .iter()
+                                            .any(|c| c.contains(&p.content))
+                                })
+                                .collect();
+
+                            if !new_conventions.is_empty() {
+                                let mut conv_ctx = String::from(
+                                    "[FlowForge Conventions] For recently edited files:",
+                                );
+                                for p in &new_conventions {
+                                    conv_ctx.push_str(&format!(
+                                        "\n- {}",
+                                        p.content
+                                    ));
+                                    let _ = db.update_pattern_short_usage(&p.id);
+                                }
+                                context_parts.push(conv_ctx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Anti-drift detection: warn when current prompt diverges from the original task
     if ctx.config.hooks.learning {
         if let Some(db) = db {
@@ -710,9 +868,8 @@ pub fn run() -> Result<()> {
                         if let Ok(Some(trajectory)) = db.get_active_trajectory(sid) {
                             if let Some(ref original_task) = trajectory.task_description {
                                 let task_vec = get_embedder().embed(original_task);
-                                let prompt_vec = get_embedder().embed(&prompt);
                                 let similarity = flowforge_memory::cosine_similarity(
-                                    &task_vec, &prompt_vec,
+                                    &task_vec, get_prompt_vec(),
                                 );
                                 if similarity < 0.25 {
                                     context_parts.push(format!(
@@ -728,6 +885,7 @@ pub fn run() -> Result<()> {
             }
         }
     }
+
 
     // Test suggestions: based on recently edited files, suggest relevant tests
     if ctx.config.hooks.learning {
@@ -788,18 +946,202 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Predictive Task Briefing: before Claude starts working, predict which files it
+    // will need, warn about known errors for those files, and suggest a proven tool sequence.
+    // Only fires for substantive prompts (≥6 words) and when we have trajectory history.
+    if ctx.config.hooks.learning && !is_trivial && word_count >= 6 {
+        if let Some(db) = db {
+            // Extract keywords (reuse same stop-word logic as pattern search)
+            const BRIEF_STOP_WORDS: &[&str] = &[
+                "the", "this", "that", "with", "from", "into", "about", "have", "been",
+                "were", "will", "just", "should", "would", "could", "also", "need", "want",
+                "make", "like", "some", "more", "very", "when", "then", "than", "only",
+                "each", "does", "done", "here", "there", "what", "your", "they", "them",
+                "please", "help", "code", "file", "change",
+            ];
+            let keywords: Vec<String> = prompt
+                .split_whitespace()
+                .map(|w| w.to_lowercase())
+                .filter(|w| w.len() >= 4 && !BRIEF_STOP_WORDS.contains(&w.as_str()))
+                .collect();
+
+            if keywords.len() >= 2 {
+                let mut brief_parts: Vec<String> = Vec::new();
+
+                // 1. Predict files from similar successful trajectories
+                if let Ok(predicted_files) = db.predict_task_files(&keywords, 15) {
+                    // Filter: prefer source code, skip docs/config unless very frequent
+                    let relevant: Vec<_> = predicted_files
+                        .iter()
+                        .filter(|(path, count)| {
+                            let is_source = path.ends_with(".rs")
+                                || path.ends_with(".ts")
+                                || path.ends_with(".py")
+                                || path.ends_with(".js")
+                                || path.ends_with(".go")
+                                || path.ends_with(".toml");
+                            // Source files: include if ≥1 session. Non-source: require ≥2.
+                            if is_source { *count >= 1 } else { *count >= 2 }
+                        })
+                        .collect();
+                    if !relevant.is_empty() {
+                        // Expand via co-edit graph: find related files not already predicted
+                        let mut expanded: Vec<(String, String)> = Vec::new(); // (file, reason)
+                        let predicted_set: std::collections::HashSet<&str> =
+                            relevant.iter().map(|(f, _)| f.as_str()).collect();
+                        for (file, _) in relevant.iter().take(3) {
+                            if let Ok(related) = db.get_related_files(file, 2) {
+                                for dep in &related {
+                                    let other = if dep.file_a == *file {
+                                        &dep.file_b
+                                    } else {
+                                        &dep.file_a
+                                    };
+                                    if !predicted_set.contains(other.as_str())
+                                        && dep.co_edit_count >= 2
+                                        && !expanded.iter().any(|(f, _)| f == other)
+                                    {
+                                        expanded.push((
+                                            other.clone(),
+                                            format!("{}x with {}", dep.co_edit_count, shorten_path(file)),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        // Prefer source code in co-edit expansion too
+                        expanded.sort_by(|a, b| {
+                            let a_src = a.0.ends_with(".rs") || a.0.ends_with(".ts") || a.0.ends_with(".py");
+                            let b_src = b.0.ends_with(".rs") || b.0.ends_with(".ts") || b.0.ends_with(".py");
+                            b_src.cmp(&a_src)
+                        });
+                        expanded.truncate(3);
+
+                        let mut files_section = String::from("FILES:");
+                        for (file, count) in relevant.iter().take(5) {
+                            let short_path = shorten_path(file);
+                            files_section.push_str(&format!(
+                                "\n  {} (edited in {} similar session{})",
+                                short_path,
+                                count,
+                                if *count > 1 { "s" } else { "" }
+                            ));
+                        }
+                        for (file, reason) in &expanded {
+                            let short_path = shorten_path(file);
+                            files_section.push_str(&format!(
+                                "\n  {} (co-edited {})",
+                                short_path, reason
+                            ));
+                        }
+                        brief_parts.push(files_section);
+
+                        // 2. Error warnings for predicted files
+                        let all_files: Vec<&str> = relevant
+                            .iter()
+                            .map(|(f, _)| f.as_str())
+                            .chain(expanded.iter().map(|(f, _)| f.as_str()))
+                            .collect();
+                        if let Ok(errors) = db.get_errors_for_files(&all_files, 5) {
+                            // Skip generic errors that apply to everything
+                            let warnings: Vec<_> = errors
+                                .iter()
+                                .filter(|(preview, _, _)| {
+                                    let lower = preview.to_lowercase();
+                                    preview.len() > 20
+                                        && !lower.starts_with("command failed with exit code")
+                                        && !lower.starts_with("exit code")
+                                        && !lower.starts_with("error:")
+                                })
+                                .take(3)
+                                .collect();
+                            if !warnings.is_empty() {
+                                let mut warn_section = String::from("WATCH OUT:");
+                                for (preview, tool, resolution) in &warnings {
+                                    let short_err: String =
+                                        preview.chars().take(80).collect();
+                                    if let Some(fix) = resolution {
+                                        warn_section.push_str(&format!(
+                                            "\n  {} ({}) -> Fix: {}",
+                                            short_err, tool, fix
+                                        ));
+                                    } else {
+                                        warn_section.push_str(&format!(
+                                            "\n  {} ({})",
+                                            short_err, tool
+                                        ));
+                                    }
+                                }
+                                brief_parts.push(warn_section);
+                            }
+                        }
+                    }
+                }
+
+                // 3. Winning tool sequence from best matching trajectory
+                if let Ok(Some(sequence)) = db.get_winning_sequence(&keywords) {
+                    if sequence.len() >= 2 {
+                        brief_parts.push(format!(
+                            "APPROACH: {}",
+                            sequence.join(" -> ")
+                        ));
+                    }
+                }
+
+                if !brief_parts.is_empty() {
+                    let mut briefing =
+                        String::from("[FlowForge Brief] Predicted from similar past sessions:");
+                    for part in &brief_parts {
+                        briefing.push_str(&format!("\n{}", part));
+                    }
+                    context_parts.push(briefing);
+
+                    if let Some(ref sid) = current_session_id {
+                        let _ = db.record_context_injection(
+                            sid,
+                            current_trajectory_id.as_deref(),
+                            "predictive_brief",
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     if context_parts.is_empty() {
         ContextOutput::none().write()?;
     } else {
-        // Apply context budget: truncate to configured char limit
-        let budget = ctx.config.hooks.context_budget_chars;
-        if budget > 0 {
+        // Adaptive context budgeting: scale budget based on session age.
+        // Early session (< 30 commands): full budget for rich context.
+        // Mid session (30-80): 75% budget — Claude has working knowledge.
+        // Late session (80+): 50% budget — conserve tokens for actual work.
+        let base_budget = ctx.config.hooks.context_budget_chars;
+        let budget = if base_budget > 0 {
+            let command_count = db
+                .and_then(|db| db.get_current_session().ok().flatten())
+                .map(|s| s.commands)
+                .unwrap_or(0);
+
+            if command_count > 80 {
+                base_budget / 2
+            } else if command_count > 30 {
+                base_budget * 3 / 4
+            } else {
+                base_budget
+            }
+        } else {
+            0
+        };
+
+        let final_output = if budget > 0 {
             let mut total = 0usize;
             let mut budgeted_parts: Vec<String> = Vec::new();
             for part in &context_parts {
                 let len = part.len();
                 if total + len + 2 > budget {
-                    // Fit what we can from this part
                     let remaining = budget.saturating_sub(total + 2);
                     if remaining > 80 {
                         let truncated: String = part.chars().take(remaining).collect();
@@ -807,12 +1149,56 @@ pub fn run() -> Result<()> {
                     }
                     break;
                 }
-                total += len + 2; // +2 for "\n\n" separator
+                total += len + 2;
                 budgeted_parts.push(part.clone());
             }
-            ContextOutput::with_context(budgeted_parts.join("\n\n")).write()?;
+            budgeted_parts.join("\n\n")
         } else {
-            ContextOutput::with_context(context_parts.join("\n\n")).write()?;
+            context_parts.join("\n\n")
+        };
+
+        // Injection deduplication: skip re-injecting identical context.
+        // Hash the output, compare to last injection. If unchanged and
+        // skip_count < 8, suppress the injection entirely to save tokens.
+        // After 8 consecutive skips, force a refresh in case Claude lost context.
+        let content_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            final_output.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        };
+
+        let should_inject = if let Some(session_id) = ctx.session_id.as_deref() {
+            if let Some(db) = db {
+                match db.get_injection_cache(session_id) {
+                    Ok(Some((cached_hash, skip_count))) if cached_hash == content_hash => {
+                        if skip_count < 8 {
+                            // Same content, skip injection
+                            let _ = db.increment_injection_skip(session_id);
+                            false
+                        } else {
+                            // Force refresh after 8 skips
+                            let _ = db.set_injection_cache(session_id, &content_hash);
+                            true
+                        }
+                    }
+                    _ => {
+                        // New or changed content — inject and cache
+                        let _ = db.set_injection_cache(session_id, &content_hash);
+                        true
+                    }
+                }
+            } else {
+                true // no DB, always inject
+            }
+        } else {
+            true // no session, always inject
+        };
+
+        if should_inject {
+            ContextOutput::with_context(final_output).write()?;
+        } else {
+            ContextOutput::none().write()?;
         }
     }
 
@@ -956,48 +1342,29 @@ fn build_routing_context(db: &MemoryDb) -> Option<RoutingContext> {
 fn load_learned_weights_from_db(
     db: &MemoryDb,
     prompt: &str,
-    embedder: &dyn flowforge_memory::Embedder,
+    prompt_vec: &[f32],
 ) -> HashMap<(String, String), f64> {
     let mut weights = HashMap::new();
 
-    // 1. Load exact matches (existing behavior)
+    // 1. Load exact matches
     if let Ok(all_weights) = db.get_all_routing_weights() {
         for w in &all_weights {
             weights.insert((w.task_pattern.clone(), w.agent_name.clone()), w.weight);
         }
-
-        // 2. Auto-backfill: create routing vectors for weights that don't have one.
-        // This ensures similarity-based generalization works for ALL learned weights,
-        // not just new ones created after instant vector creation was added.
-        for w in &all_weights {
-            let source_id = format!("{}::{}", w.task_pattern, w.agent_name);
-            if db.count_vectors_for_source_id("routing", &source_id).unwrap_or(1) == 0 {
-                let vec = embedder.embed(&w.task_pattern);
-                let _ = db.store_vector("routing", &source_id, &vec);
-            }
-        }
     }
 
-    // 3. Pre-compute similarity-based matches for generalization
-    let routing_count = db.count_vectors_for_source("routing").unwrap_or(0);
-    if routing_count == 0 {
-        return weights;
-    }
-
-    let query_vec = embedder.embed(prompt);
-
-    if let Ok(routing_vecs) = db.get_vectors_for_source("routing") {
-        for (_, source_id, vec) in &routing_vecs {
-            let sim = flowforge_memory::cosine_similarity(&query_vec, vec);
-            if sim > 0.55 {
-                // source_id is "task_pattern::agent_name"
-                if let Some((task_pattern, agent_name)) = source_id.split_once("::") {
+    // 2. Similarity-based generalization via HNSW search (fast, O(log n))
+    // instead of loading ALL routing vectors (was O(n) and very slow)
+    if let Ok(results) = db.search_vectors(prompt_vec, &["routing"], 10) {
+        for r in &results {
+            if r.similarity > 0.55 {
+                if let Some((task_pattern, agent_name)) = r.source_id.split_once("::") {
                     let key = (task_pattern.to_string(), agent_name.to_string());
                     if let Some(&original_weight) = weights.get(&key) {
                         let generalized_key = (prompt.to_string(), agent_name.to_string());
                         weights
                             .entry(generalized_key)
-                            .or_insert_with(|| original_weight * sim as f64);
+                            .or_insert_with(|| original_weight * r.similarity as f64);
                     }
                 }
             }
@@ -1030,14 +1397,30 @@ fn load_adaptive_routing_config(
     }
 }
 
+/// Shorten a file path for display: strip the common project prefix to show crate-relative paths.
+fn shorten_path(path: &str) -> &str {
+    // Try to find "crates/" prefix for Rust crate paths
+    if let Some(idx) = path.find("crates/") {
+        return &path[idx..];
+    }
+    // Try to find "src/" prefix
+    if let Some(idx) = path.find("src/") {
+        return &path[idx..];
+    }
+    // Fall back to just the filename
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+}
+
 /// Compute semantic (embedding) similarity scores for all agents against the task.
 fn compute_semantic_scores(
     db: &MemoryDb,
-    prompt: &str,
+    task_vec: &[f32],
     agents: &[&flowforge_core::AgentDef],
     embedder: &dyn flowforge_memory::Embedder,
 ) -> Option<HashMap<String, f64>> {
-    let task_vec = embedder.embed(prompt);
 
     // Try to load cached agent embeddings from DB first (source_type="agent_embed")
     let cached = db.get_vectors_for_source("agent_embed").unwrap_or_default();
@@ -1050,7 +1433,7 @@ fn compute_semantic_scores(
     let mut cache_misses = Vec::new();
     for agent in agents {
         if let Some(cached_vec) = cached_map.get(agent.name.as_str()) {
-            let sim = flowforge_memory::cosine_similarity(&task_vec, cached_vec);
+            let sim = flowforge_memory::cosine_similarity(task_vec, cached_vec);
             scores.insert(agent.name.clone(), (sim as f64).clamp(0.0, 1.0));
         } else {
             // Cache miss: compute and store
@@ -1060,7 +1443,7 @@ fn compute_semantic_scores(
                 agent_text.push_str(&agent.capabilities.join(" "));
             }
             let agent_vec = embedder.embed(&agent_text);
-            let sim = flowforge_memory::cosine_similarity(&task_vec, &agent_vec);
+            let sim = flowforge_memory::cosine_similarity(task_vec, &agent_vec);
             scores.insert(agent.name.clone(), (sim as f64).clamp(0.0, 1.0));
             cache_misses.push((agent.name.clone(), agent_vec));
         }
@@ -1072,66 +1455,40 @@ fn compute_semantic_scores(
     }
 
     // Tier 5A: Enhance with historical routing success/failure vectors
-    enhance_with_historical_matches(db, &task_vec, &mut scores);
+    enhance_with_historical_matches(db, task_vec, &mut scores);
 
     Some(scores)
 }
 
 /// Tier 5A: Blend historical routing vectors into semantic scores.
-/// Successful past routings boost scores, failures penalize.
+/// Uses HNSW search (O(log n)) instead of loading all vectors (was O(n)).
 fn enhance_with_historical_matches(
     db: &MemoryDb,
     task_vec: &[f32],
     scores: &mut HashMap<String, f64>,
 ) {
-    // Look up routing_success vectors for past successful routings
-    let success_vecs = db.get_vectors_for_source("routing_success").unwrap_or_default();
-    let failure_vecs = db.get_vectors_for_source("routing_failure").unwrap_or_default();
-
-    if success_vecs.is_empty() && failure_vecs.is_empty() {
-        return;
-    }
-
-    // Find top-3 most similar successful routings
-    let mut success_matches: Vec<(&str, f64)> = success_vecs
-        .iter()
-        .map(|(_, source_id, vec)| {
-            let sim = flowforge_memory::cosine_similarity(task_vec, vec) as f64;
-            (source_id.as_str(), sim)
-        })
-        .filter(|(_, sim)| *sim > 0.5)
-        .collect();
-    success_matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    success_matches.truncate(3);
-
-    // Boost agents from successful historical matches
-    for (source_id, sim) in &success_matches {
-        if let Some(agent_name) = source_id.split("::").nth(1) {
-            if let Some(score) = scores.get_mut(agent_name) {
-                // Blend: 60% description similarity + 40% historical
-                *score = 0.6 * *score + 0.4 * sim;
+    // HNSW search for top-3 similar successful routings
+    if let Ok(success_results) = db.search_vectors(task_vec, &["routing_success"], 3) {
+        for r in &success_results {
+            if r.similarity > 0.5 {
+                if let Some(agent_name) = r.source_id.split("::").nth(1) {
+                    if let Some(score) = scores.get_mut(agent_name) {
+                        *score = 0.6 * *score + 0.4 * r.similarity as f64;
+                    }
+                }
             }
         }
     }
 
-    // Find top-3 most similar failure routings
-    let mut failure_matches: Vec<(&str, f64)> = failure_vecs
-        .iter()
-        .map(|(_, source_id, vec)| {
-            let sim = flowforge_memory::cosine_similarity(task_vec, vec) as f64;
-            (source_id.as_str(), sim)
-        })
-        .filter(|(_, sim)| *sim > 0.5)
-        .collect();
-    failure_matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    failure_matches.truncate(3);
-
-    // Penalize agents from failed historical matches
-    for (source_id, sim) in &failure_matches {
-        if let Some(agent_name) = source_id.split("::").nth(1) {
-            if let Some(score) = scores.get_mut(agent_name) {
-                // Reduce score proportional to similarity
-                *score *= 1.0 - 0.3 * sim;
+    // HNSW search for top-3 similar failure routings
+    if let Ok(failure_results) = db.search_vectors(task_vec, &["routing_failure"], 3) {
+        for r in &failure_results {
+            if r.similarity > 0.5 {
+                if let Some(agent_name) = r.source_id.split("::").nth(1) {
+                    if let Some(score) = scores.get_mut(agent_name) {
+                        *score *= 1.0 - 0.3 * r.similarity as f64;
+                    }
+                }
             }
         }
     }
@@ -1255,7 +1612,8 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db = MemoryDb::open(tmp.path()).unwrap();
         let emb = flowforge_memory::default_embedder(&flowforge_core::config::PatternsConfig::default());
-        let weights = load_learned_weights_from_db(&db, "fix authentication bug", &*emb);
+        let prompt_vec = emb.embed("fix authentication bug");
+        let weights = load_learned_weights_from_db(&db, "fix authentication bug", &prompt_vec);
         assert!(weights.is_empty());
     }
 
@@ -1265,7 +1623,8 @@ mod tests {
         let db = MemoryDb::open(tmp.path()).unwrap();
         db.record_routing_success("fix bug", "debugger").unwrap();
         let emb = flowforge_memory::default_embedder(&flowforge_core::config::PatternsConfig::default());
-        let weights = load_learned_weights_from_db(&db, "fix bug", &*emb);
+        let prompt_vec = emb.embed("fix bug");
+        let weights = load_learned_weights_from_db(&db, "fix bug", &prompt_vec);
         assert!(
             weights.contains_key(&("fix bug".to_string(), "debugger".to_string())),
             "should contain exact match weight"
@@ -1344,5 +1703,15 @@ mod tests {
         assert!(!rc.recent_tools.is_empty(), "should capture recent tools from trajectory");
         assert!(rc.recent_tools.contains(&"Bash".to_string()));
         assert!(rc.recent_tools.contains(&"Read".to_string()));
+    }
+
+    #[test]
+    fn test_shorten_path() {
+        assert_eq!(
+            shorten_path("/Users/matt/Projects/flowforge/crates/flowforge-cli/src/main.rs"),
+            "crates/flowforge-cli/src/main.rs"
+        );
+        assert_eq!(shorten_path("/tmp/src/lib.rs"), "src/lib.rs");
+        assert_eq!(shorten_path("/tmp/foo.rs"), "foo.rs");
     }
 }

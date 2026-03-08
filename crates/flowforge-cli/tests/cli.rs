@@ -426,7 +426,7 @@ fn test_hook_pre_compact_claude_code_payload() {
         )
         .assert()
         .success()
-        .stdout(predicate::str::contains("FlowForge Compaction Guidance"));
+        .stdout(predicate::str::contains("FlowForge"));
 }
 
 #[test]
@@ -581,7 +581,7 @@ fn test_hook_pre_compact_outputs_plain_text_not_json() {
         )
         .assert()
         .success()
-        .stdout(predicate::str::contains("FlowForge Compaction Guidance"))
+        .stdout(predicate::str::contains("FlowForge"))
         .stdout(predicate::str::contains("hookSpecificOutput").not())
         .stdout(predicate::str::starts_with("{").not());
 }

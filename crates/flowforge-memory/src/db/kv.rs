@@ -64,17 +64,40 @@ impl MemoryDb {
     }
 
     pub fn kv_search(&self, query: &str, limit: usize) -> Result<Vec<(String, String, String)>> {
-        let pattern = format!("%{query}%");
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT key, value, namespace FROM key_value
-                 WHERE key LIKE ?1 OR value LIKE ?1
-                 ORDER BY updated_at DESC LIMIT ?2",
-            )
-            .sq()?;
+        // Extract keywords (4+ chars) and search for any match in key or value
+        let keywords: Vec<String> = query
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .filter(|w| w.len() >= 4)
+            .collect();
+
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conditions: Vec<String> = keywords
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("(LOWER(key) LIKE ?{0} OR LOWER(value) LIKE ?{0})", i + 1))
+            .collect();
+        let where_clause = conditions.join(" OR ");
+        let sql = format!(
+            "SELECT key, value, namespace FROM key_value WHERE {} ORDER BY updated_at DESC LIMIT ?{}",
+            where_clause,
+            keywords.len() + 1
+        );
+
+        let mut stmt = self.conn.prepare(&sql).sq()?;
+        let like_params: Vec<String> = keywords.iter().map(|k| format!("%{}%", k)).collect();
+        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+        for p in &like_params {
+            params_vec.push(p as &dyn rusqlite::types::ToSql);
+        }
+        let limit_val = limit as i64;
+        params_vec.push(&limit_val);
+
         let rows = stmt
-            .query_map(params![pattern, limit], |row| {
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,

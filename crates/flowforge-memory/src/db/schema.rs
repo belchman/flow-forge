@@ -3,7 +3,7 @@ use flowforge_core::{Error, Result};
 use super::{is_transient_sqlite, MemoryDb, SqliteExt};
 
 /// Bump this whenever init_schema() changes (new tables, columns, indexes).
-pub(crate) const SCHEMA_VERSION: u32 = 8;
+pub(crate) const SCHEMA_VERSION: u32 = 12;
 
 impl MemoryDb {
     pub(crate) fn init_schema(&self) -> Result<()> {
@@ -601,6 +601,9 @@ impl MemoryDb {
             )
             .sq()?;
 
+        // Link session_tool_failures to error_fingerprints for reliable resolution matching
+        self.migrate_add_column("session_tool_failures", "fingerprint_id", "TEXT")?;
+
         // Test co-occurrence suggestions
         self.conn
             .execute_batch(
@@ -616,6 +619,68 @@ impl MemoryDb {
                 );
                 CREATE INDEX IF NOT EXISTS idx_test_cooccur_edited ON test_co_occurrences(edited_file);
                 CREATE INDEX IF NOT EXISTS idx_test_cooccur_test ON test_co_occurrences(test_file);
+                ",
+            )
+            .sq()?;
+
+        // Injection deduplication cache: skip re-injecting identical context
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS injection_cache (
+                    session_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    skip_count INTEGER NOT NULL DEFAULT 0
+                );
+                ",
+            )
+            .sq()?;
+
+        // v12: Project intelligence
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS project_intelligence (
+                    section_key TEXT PRIMARY KEY,
+                    section_title TEXT NOT NULL,
+                    content TEXT NOT NULL DEFAULT '',
+                    auto_generated INTEGER NOT NULL DEFAULT 1,
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    embedding_id INTEGER,
+                    project_type TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                ",
+            )
+            .sq()?;
+
+        // v11: Read dedup tracking + code index
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS session_reads (
+                    session_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    command_number INTEGER NOT NULL DEFAULT 0,
+                    timestamp TEXT NOT NULL,
+                    UNIQUE(session_id, file_path)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_reads_session ON session_reads(session_id);
+
+                CREATE TABLE IF NOT EXISTS code_index (
+                    file_path TEXT PRIMARY KEY,
+                    language TEXT NOT NULL DEFAULT 'unknown',
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    symbols TEXT NOT NULL DEFAULT '[]',
+                    description TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL,
+                    indexed_at TEXT NOT NULL,
+                    embedding_id INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_code_index_lang ON code_index(language);
+                CREATE INDEX IF NOT EXISTS idx_code_index_embedding ON code_index(embedding_id);
                 ",
             )
             .sq()?;

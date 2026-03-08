@@ -51,9 +51,10 @@ pub fn run_safe(
     let elapsed_ms = start.elapsed().as_millis() as f64;
     record_hook_timing(hook_name, elapsed_ms, succeeded);
 
-    // If the hook failed without producing output, emit a valid empty response
-    // so Claude Code doesn't report "hook error" from missing stdout.
-    if !succeeded {
+    // Only PreToolUse needs a JSON fallback on failure (it returns hookSpecificOutput).
+    // Context hooks (SessionStart, UserPromptSubmit, PreCompact, SubagentStart) output
+    // plain text — emitting JSON on failure would be incorrect noise.
+    if !succeeded && hook_name == "pre-tool-use" {
         println!("{{\"hookSpecificOutput\":{{}}}}");
     }
 
@@ -262,10 +263,39 @@ pub fn run_session_learning(ctx: &HookContext, session: &flowforge_core::Session
 
         if result.verdict == flowforge_core::trajectory::TrajectoryVerdict::Success {
             let _ = judge.distill(&trajectory.id);
+
+            // Store successful task description as a high-quality pattern.
+            // These are outcome-backed: the task was actually completed successfully.
+            if let Some(ref task_desc) = trajectory.task_description {
+                if task_desc.len() >= 15 {
+                    let store = flowforge_memory::PatternStore::new(db, &ctx.config.patterns);
+                    let content: String = task_desc.chars().take(200).collect();
+                    let _ = store.store_short_term(&content, "task-success");
+                }
+            }
         }
 
         // Auto-detect error resolutions from trajectory steps
-        let _ = db.auto_detect_resolutions(&sid, &trajectory.id);
+        let resolutions_found = db.auto_detect_resolutions(&sid, &trajectory.id).unwrap_or(0);
+
+        // Store detected resolutions as high-quality patterns for injection
+        if resolutions_found > 0 {
+            if let Ok(fingerprints) = db.list_error_fingerprints(10) {
+                let store = flowforge_memory::PatternStore::new(db, &ctx.config.patterns);
+                for fp in fingerprints.iter().take(resolutions_found as usize) {
+                    if let Ok(resolutions) = db.get_resolutions_for_fingerprint(&fp.id, 1) {
+                        if let Some(res) = resolutions.first() {
+                            let content = format!(
+                                "Error fix: {} → {}",
+                                fp.error_preview.chars().take(80).collect::<String>(),
+                                res.resolution_summary
+                            );
+                            let _ = store.store_short_term(&content, "error-fix");
+                        }
+                    }
+                }
+            }
+        }
 
         // Effectiveness feedback: routing accuracy + pattern confidence
         if let Ok(injections) = db.get_injections_for_session(&sid) {
@@ -364,6 +394,58 @@ pub fn run_session_learning(ctx: &HookContext, session: &flowforge_core::Session
         }
 
         let _ = judge.consolidate();
+        Ok(())
+    });
+
+    // Auto-discover conventions from edit patterns in successful sessions.
+    // When the same file types are consistently edited together, store as convention.
+    ctx.with_db("auto_discover_conventions", |db| {
+        if let Ok(edits) = db.get_edits_for_session(&sid) {
+            if edits.len() < 3 {
+                return Ok(());
+            }
+
+            // Check for schema + test co-edits
+            let edited_files: Vec<&str> = edits.iter().map(|e| e.file_path.as_str()).collect();
+            let has_schema = edited_files.iter().any(|f| f.contains("schema"));
+            let has_test = edited_files.iter().any(|f| f.contains("test"));
+            let has_main = edited_files.iter().any(|f| f.contains("main.rs"));
+            let has_hooks = edited_files.iter().any(|f| f.contains("hooks/"));
+
+            // If schema was edited with tests → reinforce the schema convention
+            if has_schema && has_test {
+                let store = flowforge_memory::PatternStore::new(db, &ctx.config.patterns);
+                // Check if convention already exists before creating
+                if let Ok(existing) = db.search_patterns_by_keywords("schema SCHEMA_VERSION", 1) {
+                    if !existing.is_empty() {
+                        let _ = store.record_feedback(&existing[0].id, true);
+                    }
+                }
+            }
+
+            // If hooks were edited with binary rebuild → reinforce hooks convention
+            if has_hooks {
+                let store = flowforge_memory::PatternStore::new(db, &ctx.config.patterns);
+                if let Ok(existing) = db.search_patterns_by_keywords("modifying hooks rebuild", 1)
+                {
+                    if !existing.is_empty() {
+                        let _ = store.record_feedback(&existing[0].id, true);
+                    }
+                }
+            }
+
+            // If main.rs was edited with commands module → reinforce CLI convention
+            if has_main && edited_files.iter().any(|f| f.contains("commands/")) {
+                let store = flowforge_memory::PatternStore::new(db, &ctx.config.patterns);
+                if let Ok(existing) =
+                    db.search_patterns_by_keywords("adding CLI commands enum variant", 1)
+                {
+                    if !existing.is_empty() {
+                        let _ = store.record_feedback(&existing[0].id, true);
+                    }
+                }
+            }
+        }
         Ok(())
     });
 

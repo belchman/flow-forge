@@ -24,6 +24,90 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Track file reads for dedup intelligence (Feature A)
+    if input.tool_name == "Read" {
+        if let Some(file_path) = input.tool_input.get("file_path").and_then(|v| v.as_str()) {
+            ctx.with_db("record_file_read", |db| {
+                // Hash the file content for change detection
+                if let Ok(content) = std::fs::read(file_path) {
+                    let hash = format!("{:x}", Sha256::digest(&content));
+                    let cmd_num = db
+                        .get_current_session()
+                        .ok()
+                        .flatten()
+                        .map(|s| s.commands as u32)
+                        .unwrap_or(0);
+                    let session_id = db
+                        .get_current_session()?
+                        .map(|s| s.id)
+                        .unwrap_or_default();
+                    if !session_id.is_empty() {
+                        db.record_file_read(&session_id, file_path, &hash, cmd_num)?;
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
+    // Auto-reindex: when Claude writes/edits a file in the code index, re-index it
+    if matches!(input.tool_name.as_str(), "Write" | "Edit" | "MultiEdit") {
+        if let Some(file_path) = input
+            .tool_input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+        {
+            ctx.with_db("auto_reindex", |db| {
+                // Only re-index if already in the code index
+                if db.get_code_entry_hash(file_path).ok().flatten().is_some() {
+                    let abs_path = Path::new(file_path);
+                    if abs_path.exists() {
+                        if let Ok(content) = std::fs::read_to_string(abs_path) {
+                            let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+                            let language =
+                                flowforge_core::code_symbols::detect_language(abs_path)
+                                    .unwrap_or("unknown");
+                            let symbols =
+                                flowforge_core::code_symbols::extract_symbols(&content, language);
+                            let description = flowforge_core::code_symbols::extract_description(
+                                &content, language,
+                            );
+
+                            // Use a relative path if possible
+                            let cwd = std::env::current_dir().ok();
+                            let rel_path = cwd
+                                .as_ref()
+                                .and_then(|cwd| abs_path.strip_prefix(cwd).ok())
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| file_path.to_string());
+
+                            let summary = flowforge_core::code_symbols::build_summary(
+                                &rel_path,
+                                &symbols,
+                                &description,
+                            );
+
+                            let entry =
+                                flowforge_memory::db::code_index::CodeIndexEntry {
+                                    file_path: rel_path,
+                                    language: language.to_string(),
+                                    size_bytes: content.len() as i64,
+                                    symbols,
+                                    description,
+                                    summary,
+                                    content_hash: hash,
+                                    indexed_at: Utc::now(),
+                                    embedding_id: None,
+                                };
+                            let _ = db.upsert_code_entry(&entry);
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
     // Sync Claude Tasks → FlowForge work items
     match input.tool_name.as_str() {
         "TaskCreate" => {

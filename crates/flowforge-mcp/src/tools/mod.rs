@@ -3,6 +3,7 @@ mod conversations;
 mod failure_patterns;
 mod file_dependencies;
 mod guidance;
+mod intelligence;
 mod learning;
 mod mailbox;
 mod memory;
@@ -219,6 +220,25 @@ impl ToolRegistry {
             "semantic_search" => {
                 self.use_db(
                     |db, c, p| semantic_search(db, c, p, &self.multi_cache),
+                    params,
+                )
+            }
+
+            // Project Intelligence
+            "intelligence_get" => self.use_db(|db, _, p| intelligence::get(db, p), params),
+            "intelligence_update" => {
+                self.use_db(
+                    |db, c, p| intelligence::update(db, c, p),
+                    params,
+                )
+            }
+            "intelligence_refine" => self.use_db(|db, _, _| intelligence::refine(db), params),
+            "intelligence_status" => self.use_db(|db, _, _| intelligence::status(db), params),
+
+            // Codebase search (dedicated code index search)
+            "codebase_search" => {
+                self.use_db(
+                    |db, c, p| codebase_search(db, c, p, &self.multi_cache),
                     params,
                 )
             }
@@ -671,13 +691,38 @@ impl ToolRegistry {
             .optional_int_default("limit", "Max results", 5)
             .build();
         tools
-            .tool("semantic_search", "Cross-source semantic vector search across all FlowForge memory (patterns, trajectories, errors, work items, conversations)")
+            .tool("semantic_search", "Cross-source semantic vector search across all FlowForge memory (patterns, trajectories, errors, work items, conversations, code_file, project_intel)")
             .required_str("query", "Search query text to find semantically similar entries")
             .optional_int_default("limit", "Max results per source type", 5)
-            .optional_str("source_types", "Comma-separated source types to search (default: all). Options: pattern_short, pattern_long, trajectory, error, work_item, conversation")
+            .optional_str("source_types", "Comma-separated source types to search (default: all). Options: pattern_short, pattern_long, trajectory, error, work_item, conversation, code_file, project_intel")
+            .build();
+        tools
+            .tool("codebase_search", "Search the project code index for files by symbols, description, or semantic similarity. Requires `flowforge index` to have been run first.")
+            .required_str("query", "Search query — file name, symbol name, or description text")
+            .optional_int_default("limit", "Max results to return", 10)
+            .optional_bool("semantic", "Also search by semantic similarity (slower but finds conceptual matches)")
             .build();
         tools
             .tool("batching_insights", "Detect sequential tool calls that could be parallelized for efficiency")
+            .build();
+
+        // Project Intelligence tools
+        tools
+            .tool("intelligence_get", "Get project intelligence sections (auto-generated docs about the project)")
+            .optional_str("section", "Specific section key (e.g., 'overview', 'conventions'). Omit for all sections.")
+            .build();
+        tools
+            .tool("intelligence_update", "Update a project intelligence section with refined content")
+            .required_str("section", "Section key to update (e.g., 'overview', 'conventions')")
+            .required_str("content", "New markdown content for the section")
+            .optional_num_default("confidence", "Confidence score 0.0-1.0 for the refined content", 0.9)
+            .build();
+        tools
+            .tool("intelligence_refine", "Get intelligence sections needing refinement (confidence < 60%) with instructions for Claude to improve them")
+            .optional_str("section", "Specific section key to refine. Omit for all low-confidence sections.")
+            .build();
+        tools
+            .tool("intelligence_status", "Get project intelligence generation status: section count, confidence, staleness")
             .build();
     }
 }
@@ -780,6 +825,8 @@ fn semantic_search(
         "error",
         "work_item",
         "conversation",
+        "code_file",
+        "project_intel",
     ];
 
     let source_types: Vec<&str> = if let Some(filter) = params.opt_str("source_types") {
@@ -821,6 +868,75 @@ fn semantic_search(
     }))
 }
 
+fn codebase_search(
+    db: &MemoryDb,
+    config: &FlowForgeConfig,
+    params: &Value,
+    cache: &MultiHnswCache,
+) -> flowforge_core::Result<Value> {
+    use crate::params::ParamExt;
+    let query = params.require_str("query")?;
+    let limit = params.u64_or("limit", 10) as usize;
+    let use_semantic = params.bool_or("semantic", false);
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // 1. Keyword LIKE search on symbols, file_path, description
+    if let Ok(entries) = db.search_code_symbols(query, limit) {
+        for entry in entries {
+            if seen.insert(entry.file_path.clone()) {
+                results.push(json!({
+                    "file_path": entry.file_path,
+                    "language": entry.language,
+                    "symbols": entry.symbols,
+                    "description": entry.description,
+                    "size_bytes": entry.size_bytes,
+                    "match_type": "keyword",
+                }));
+            }
+        }
+    }
+
+    // 2. Optional semantic search via code_file vectors
+    if use_semantic && results.len() < limit {
+        let embedder = flowforge_memory::default_embedder(&config.patterns);
+        let query_vec = embedder.embed(query);
+        let remaining = limit - results.len();
+        if let Ok(vec_results) =
+            db.search_vectors_cached(&query_vec, &["code_file"], remaining * 2, cache)
+        {
+            for r in vec_results.iter().filter(|r| r.similarity > 0.3) {
+                if seen.insert(r.source_id.clone()) {
+                    if let Ok(Some(entry)) = db.get_code_entry(&r.source_id) {
+                        results.push(json!({
+                            "file_path": entry.file_path,
+                            "language": entry.language,
+                            "symbols": entry.symbols,
+                            "description": entry.description,
+                            "size_bytes": entry.size_bytes,
+                            "similarity": format!("{:.1}%", r.similarity * 100.0),
+                            "match_type": "semantic",
+                        }));
+                    }
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    results.truncate(limit);
+
+    Ok(json!({
+        "status": "ok",
+        "query": query,
+        "total_results": results.len(),
+        "results": results,
+    }))
+}
+
 fn batching_insights(db: &MemoryDb) -> flowforge_core::Result<Value> {
     let stats = db.get_global_batching_stats(2, 20)?;
     Ok(json!({
@@ -848,9 +964,9 @@ mod tests {
     use crate::params::ParamExt;
 
     #[test]
-    fn test_registry_has_68_tools() {
+    fn test_registry_has_74_tools() {
         let registry = ToolRegistry::new();
-        assert_eq!(registry.list().len(), 69);
+        assert_eq!(registry.list().len(), 74);
     }
 
     #[test]

@@ -94,6 +94,46 @@ pub fn run() -> Result<()> {
             active_trajectory_id: None,
         });
 
+    // 0. Read dedup: warn if Claude re-reads an unchanged file
+    if input.tool_name == "Read" {
+        if let Some(file_path) = input.tool_input.get("file_path").and_then(|v| v.as_str()) {
+            let sid = state.session_id.clone();
+            let fp = file_path.to_string();
+            let dedup_result = ctx.with_db("check_read_dedup", |db| {
+                if let Some((stored_hash, cmd_num)) = db.get_file_read(&sid, &fp)? {
+                    // Check file size — skip dedup for files >1MB
+                    let metadata = std::fs::metadata(&fp);
+                    if let Ok(meta) = metadata {
+                        if meta.len() > 1_048_576 {
+                            return Ok(None);
+                        }
+                        // Hash current file and compare
+                        if let Ok(content) = std::fs::read(&fp) {
+                            let current_hash =
+                                format!("{:x}", sha2::Sha256::digest(&content));
+                            if current_hash == stored_hash {
+                                let short_path = fp
+                                    .rfind('/')
+                                    .map(|i| &fp[i + 1..])
+                                    .unwrap_or(&fp);
+                                return Ok(Some(format!(
+                                    "You already read {} at command #{}. File unchanged.",
+                                    short_path, cmd_num
+                                )));
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            });
+            if let Some(Some(msg)) = dedup_result {
+                let output = PreToolUseOutput::ask(msg);
+                hook::write_stdout(&output)?;
+                return Ok(());
+            }
+        }
+    }
+
     // 1. Guidance gates (if enabled)
     if ctx.config.guidance.enabled {
         let engine =
